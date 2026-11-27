@@ -392,7 +392,7 @@ def _dsh_policy(work, model, effort, web, archive):
             }})
         elif deepseek_mcp:
             # Headless normally disables this plugin. The MCP template reads the inherited key through it.
-            policy.append({"id": "credentials", "disabled": False, "config": {"watch": False}})
+            policy.append({"id": "credentials", "disabled": False})
     if web or archive:
         args = ["-m", "evosight.web_search_tool"]
         if not web:
@@ -401,18 +401,19 @@ def _dsh_policy(work, model, effort, web, archive):
             path = work / "archive.json"
             path.write_text(dump(archive), encoding="utf-8")
             args.extend(["--archive-file", str(path)])
-        mcp = {
+        config = {
             "serverName": "evosight_web", "transport": "stdio", "command": sys.executable,
             "args": args, "cwd": str(Path(__file__).resolve().parents[1]),
             "toolCallTimeoutMs": 30000, "startupTimeoutMs": 20000,
         }
+        plugin = {"id": "mcp-evosight-search", "name": "@deepseek-ai/dsh-mcp-client", "config": config}
         if deepseek_mcp:
-            mcp.update(expandTemplates=True, env={
+            # The MCP plugin only declares the tools service. Wait for credentials before resolving templates.
+            plugin["inject"] = ["tools", "credentials"]
+            config.update(expandTemplates=True, env={
                 "EVOSIGHT_PUBLIC_SEARCH": "deepseek", "DEEPSEEK_API_KEY": "${credential:DEEPSEEK_API_KEY}",
             })
-        policy.append({"insert": [{
-            "id": "mcp-evosight-search", "name": "@deepseek-ai/dsh-mcp-client", "config": mcp,
-        }]})
+        policy.append({"insert": [plugin]})
     return policy
 
 
@@ -487,7 +488,7 @@ class Runner:
                 if web:
                     prompt = _web_guidance(
                         role, "优先用 DSH 内置 web_search 定位发布方原文。内置搜索不可用、无结果或仍缺目标来源时，"
-                        "再用 EvoSight 的 search_public_web 补查。一次只搜一个发布方或一个证据缺口。"
+                        "再用 EvoSight 的 mcp__evosight_web__search_public_web 补查。一次只搜一个发布方或一个证据缺口。"
                     ) + prompt
                 if archive:
                     prompt = (

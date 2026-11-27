@@ -107,8 +107,10 @@ def test_headless_dsh_can_resolve_the_program_search_key_without_a_desktop_store
     monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-key")
     policy = agents._dsh_policy(tmp_path, "dashscope/kimi-k3.1-pro", "low", True, ())
     credentials = next(item for item in policy if item.get("id") == "credentials")
-    assert credentials["disabled"] is False and "path" not in credentials["config"]
-    mcp = next(item["insert"][0]["config"] for item in policy if "insert" in item)
+    assert credentials == {"id": "credentials", "disabled": False}
+    plugin = next(item["insert"][0] for item in policy if "insert" in item)
+    assert plugin["inject"] == ["tools", "credentials"]
+    mcp = plugin["config"]
     assert mcp["expandTemplates"] is True
     assert mcp["env"]["DEEPSEEK_API_KEY"] == "${credential:DEEPSEEK_API_KEY}"
     assert "fixture-key" not in repr(policy)
@@ -174,6 +176,7 @@ def test_dsh_resumes_and_mounts_only_the_turns_allowed_tools(tmp_path, monkeypat
             assert by_id["tool-web"]["config"]["search"] and not by_id["tool-web"]["config"]["fetch"]
             assert by_id["web-deepseek-api"]["config"]["searchBaseURL"] == "https://api.deepseek.com/v1/tools"
             assert "优先用 DSH 内置 web_search" in prompt and "--archive-only" not in args
+            assert "mcp__evosight_web__search_public_web" in prompt
         else:
             assert by_id["tool-web"]["disabled"] and "--archive-only" in args
             assert "web-deepseek-api" not in by_id and "优先用 DSH 内置 web_search" not in prompt
