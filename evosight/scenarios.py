@@ -123,13 +123,18 @@ def check_draft(draft, context, now):
     else:
         due = instant(fixed["deadline"] if fixed else draft.deadline)
         supplied = draft.scale.registered(now, due) if draft.scale else None
-        scale = (fixed or {}).get("scale") or supplied
+        registered_scale = (fixed or {}).get("scale")
+        scale = (
+            {**registered_scale, "window_start": instant(registered_scale["window_start"])}
+            if registered_scale else supplied
+        )
         if fixed:
             wanted = fixed.get("form", "binary")
             if (wanted == "ordered" and not scale) or (wanted == "binary" and scale):
                 raise ValueError("须采用固定题指定的预测题型")
-            if (fixed.get("scale") and supplied and supplied != scale) or (
-                fixed.get("window_start") and (not scale or scale["window_start"] != fixed["window_start"])
+            registered_start = fixed.get("window_start")
+            if (registered_scale and supplied and supplied != scale) or (
+                registered_start and (not scale or scale["window_start"] != instant(registered_start))
             ):
                 raise ValueError("固定题给定的观察窗口和分档须保持一致")
     if scale:

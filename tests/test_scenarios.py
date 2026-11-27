@@ -1,6 +1,6 @@
 """An outcome can be the registered degree of change across a multi-month window."""
 import copy
-from datetime import timedelta
+from datetime import timedelta, timezone
 import json
 
 from fastapi.testclient import TestClient
@@ -34,6 +34,33 @@ def opinion(doc, probabilities=(25, 50, 25), primary=1):
         "dimensions": [{"name": "适用范围", "expectation": "优先影响一个产品类别。", "refs": [doc]}],
         "reconsider_if": "若主管机构同时明确两个不同类别的生效要求，须上调主情景。",
     }
+
+
+def test_fixed_scale_compares_observation_start_as_an_instant(clock):
+    scale = rubric(clock)
+    start = clock.dt + timedelta(days=90)
+    localized = start.astimezone(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+    deadline = clock.utc(clock.dt + timedelta(days=180))
+    draft = agents.Forecast(
+        action="create", prediction_id=0, question="窗口内政策会如何变化？", deadline=deadline,
+        rule="按生效范围判定", authority="主管单位公告", reason="公开材料支持定向变化。",
+        evidence_ids=[1], scale=scale, outlook=opinion(1),
+    )
+    context = {
+        "固定题": {
+            "form": "ordered", "deadline": deadline, "window_start": localized,
+            "scale": {**scale, "window_start": localized},
+        },
+        "evidence": [{"id": 1}],
+    }
+    scenarios.check_draft(draft, context, clock.utc())
+
+    later_start = clock.utc(start + timedelta(minutes=1))
+    revised_levels = [{**scale["levels"][0], "criterion": "新增措施仅延长期限。"}, *scale["levels"][1:]]
+    for changed_scale in ({**scale, "window_start": later_start}, {**scale, "levels": revised_levels}):
+        revised = draft.model_copy(update={"scale": scenarios.Scale.model_validate(changed_scale)})
+        with pytest.raises(ValueError, match="观察窗口和分档须保持一致"):
+            scenarios.check_draft(revised, context, clock.utc())
 
 
 @pytest.fixture
