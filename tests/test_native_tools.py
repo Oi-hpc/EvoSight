@@ -100,6 +100,20 @@ def test_linux_npm_codex_only_grants_read_access_to_the_native_binary(tmp_path, 
     assert policy["network"] == {"enabled": False}
 
 
+def test_headless_dsh_can_resolve_the_program_search_key_without_a_desktop_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("EVOSIGHT_PUBLIC_SEARCH", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-key")
+    policy = agents._dsh_policy(tmp_path, "dashscope/kimi-k3.1-pro", "low", True, ())
+    credentials = next(item for item in policy if item.get("id") == "credentials")
+    assert credentials["disabled"] is False and "path" not in credentials["config"]
+    mcp = next(item["insert"][0]["config"] for item in policy if "insert" in item)
+    assert mcp["expandTemplates"] is True
+    assert mcp["env"]["DEEPSEEK_API_KEY"] == "${credential:DEEPSEEK_API_KEY}"
+    assert "fixture-key" not in repr(policy)
+
+
 @pytest.mark.parametrize("time_scope", ["window", "history"])
 def test_news_prompt_uses_saved_round_window_when_resuming(tmp_path, monkeypatch, time_scope):
     monkeypatch.delenv("EVOSIGHT_CODEX_SEARCH", raising=False)

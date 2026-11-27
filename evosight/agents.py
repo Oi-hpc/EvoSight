@@ -365,6 +365,7 @@ def _web_guidance(role, search):
 
 def _dsh_policy(work, model, effort, web, archive):
     policy = [{"id": key, "disabled": True} for key in OFF if key != "tool-web" or not web]
+    deepseek_mcp = web and os.getenv("EVOSIGHT_PUBLIC_SEARCH") == "deepseek"
     policy.extend([
         {"id": "agent-default-model", "config": {"provider": "cannbot", "model": model, "reasoningEffort": effort}},
         {"id": "permission", "config": {
@@ -389,6 +390,9 @@ def _dsh_policy(work, model, effort, web, archive):
             policy.append({"id": "credentials", "disabled": False, "config": {
                 "path": str(credentials), "watch": False,
             }})
+        elif deepseek_mcp:
+            # Headless normally disables this plugin. The MCP template reads the inherited key through it.
+            policy.append({"id": "credentials", "disabled": False, "config": {"watch": False}})
     if web or archive:
         args = ["-m", "evosight.web_search_tool"]
         if not web:
@@ -402,7 +406,7 @@ def _dsh_policy(work, model, effort, web, archive):
             "args": args, "cwd": str(Path(__file__).resolve().parents[1]),
             "toolCallTimeoutMs": 30000, "startupTimeoutMs": 20000,
         }
-        if web and os.getenv("EVOSIGHT_PUBLIC_SEARCH") == "deepseek":
+        if deepseek_mcp:
             mcp.update(expandTemplates=True, env={
                 "EVOSIGHT_PUBLIC_SEARCH": "deepseek", "DEEPSEEK_API_KEY": "${credential:DEEPSEEK_API_KEY}",
             })
