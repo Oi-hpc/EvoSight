@@ -1,4 +1,3 @@
-#!/opt/evosight/runtime/bin/python
 """Package a committed EvoSight version and switch a Linux installation to it."""
 import argparse
 from contextlib import closing
@@ -27,6 +26,16 @@ PYTHON = ROOT / "runtime" / "bin" / "python"
 SERVICE = "evosight.service"
 REVISION = "EVOSIGHT_REVISION"
 PREPARED = ".prepared"
+RUNTIME_CHECK = """
+import sqlite3
+
+if sqlite3.sqlite_version_info < (3, 35, 0):
+    raise SystemExit(f"EvoSight needs SQLite 3.35 or later, found {sqlite3.sqlite_version}")
+with sqlite3.connect(":memory:") as connection:
+    connection.execute("SELECT value FROM json_each('[1]')").fetchone()
+
+from evosight.api import make_app
+"""
 
 
 def checksum(file):
@@ -82,7 +91,6 @@ def prepare(bundle, expected):
             [interpreter, "-m", "pip", "install", "--disable-pip-version-check", "-r", "requirements.txt"],
             cwd=release, check=True,
         )
-        subprocess.run([interpreter, "-c", "from evosight.api import make_app"], cwd=release, check=True)
         (release / PREPARED).touch()
     return release
 
@@ -155,6 +163,7 @@ def healthy(target):
 
 
 def activate(target):
+    subprocess.run([target / ".venv/bin/python", "-c", RUNTIME_CHECK], cwd=target, check=True)
     old = link_target(CURRENT)
     stop_idle()
     try:

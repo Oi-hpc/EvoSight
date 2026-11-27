@@ -57,7 +57,7 @@ Codex 在查源、侦查和最新资料讨论中可调用 EvoSight 的只读 `se
 
 ## 首次安装
 
-运行需要 Python 3.11 及以上、Node.js 22.12 及以上和已配置的 Codex CLI。新闻侦查默认使用 DSH，需要 DSH 和 CANNBot 配置，也可在设置中切换为 Codex。本机用 Windows 原生 Python 3.14 和 Node 24 完成联调。
+运行需要 Python 3.11 及以上、SQLite 3.35 及以上（含 JSON 函数）、Node.js 22.12 及以上和已配置的 Codex CLI。新闻侦查默认使用 DSH，需要 DSH 和 CANNBot 配置，也可在设置中切换为 Codex。本机用 Windows 原生 Python 3.14 和 Node 24 完成联调。
 
 ```powershell
 python -m venv .venv
