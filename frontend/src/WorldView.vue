@@ -36,6 +36,8 @@ type Citation = {
   title: string
 }
 type Detail = {
+  disposition?: { state: string; target: number | null; reason: string } | null
+  disputes?: { id: number; field: string; proposed: string; reason: string; state: string; resolution: string | null }[]
   id: number
   demo: number
   head_id: number
@@ -46,6 +48,8 @@ type Detail = {
   schema_id: string
   schema_version: number
   attributes: Record<string, string | number>
+  field_evidence?: { field: string; fragment_id: number; quote: string }[]
+  card_evidence?: Record<string, { asset_id?: number; document_id?: number; fragment_id: number; method: string; locator: string; quote: string }[]>
   field_labels: Record<string, string>
   claim: {
     id: number
@@ -85,6 +89,24 @@ const error = ref(''),
   expected = ref<number | null>(null),
   saving = ref(false)
 const pageSize = 24
+const dispositionNames: Record<string, string> = { event: '事件专属材料', withdrawn: '已撤回', merged: '已合并' }
+const change = ref({ state: 'withdrawn', target: 0, targetVersion: 0, fragment: 0, reason: '' })
+async function recordChange(dispute?: number) {
+  const value = item.value
+  if (!value || saving.value) return
+  saving.value = true
+  try {
+    const form = change.value
+    const decision = { version_id: value.head_id, fragment_id: form.fragment, reason: form.reason }
+    if (dispute) await api(`/world/${value.id}/disputes/${dispute}/resolve`, decision)
+    else await api(`/world/${value.id}/disposition`, { ...decision, state: form.state,
+      target: form.state === 'merged' ? form.target : null, target_version: form.state === 'merged' ? form.targetVersion : null })
+    notice.value = '已保存处理结果'
+    change.value.reason = ''
+    await load()
+  } catch (err) { error.value = (err as Error).message }
+  finally { saving.value = false }
+}
 const available = computed(() => props.events.filter((e) => !e.demo))
 const existingLink = computed(() => item.value?.events.find((link) => link.id === chosen.value))
 const route = (entry = 0, version = 0, path = props.catalogPath) =>
@@ -329,6 +351,22 @@ onBeforeUnmount(() => {
           <dd>{{ v }}</dd></template
         >
       </dl>
+      <details v-if="item.card_evidence && Object.keys(item.card_evidence).length">
+        <summary>资料卡字段来源</summary>
+        <div v-for="(proof, key) in item.card_evidence" :key="key">
+          <strong>{{ item.field_labels[key] || key }}</strong>
+          <p v-for="ref in proof" :key="ref.fragment_id + ref.locator">
+            {{ ref.method === 'archive' ? '归档元数据' : '已核对的提议' }} · {{ ref.locator }} · {{ ref.quote }}
+            <a v-if="ref.document_id" :href="'#/events/' + item.claim.event_id + '/doc/' + ref.document_id + '/' + ref.fragment_id">查看片段 #{{ ref.fragment_id }}</a>
+          </p>
+        </div>
+      </details>
+      <details v-if="item.field_evidence?.length">
+        <summary>查看逐字段原文</summary>
+        <p v-for="ref in item.field_evidence" :key="ref.field + '/' + ref.fragment_id">
+          {{ item.field_labels[ref.field.replace(/^attributes\./, '')] || ref.field }} · {{ ref.quote }}（片段 #{{ ref.fragment_id }}）
+        </p>
+      </details>
       <p v-if="missingLabels.length" class="meta">尚未收录{{ missingLabels.join('、') }}。</p>
       <a
         class="meta"
@@ -364,7 +402,7 @@ onBeforeUnmount(() => {
         <a :href="'#/events/' + e.id + '/knowledge'">{{ e.title }}</a> · {{ e.index_reason }}
       </p>
       <form
-        v-if="!item.demo && available.length && item.claim.id === item.head_id"
+        v-if="!item.demo && !item.disposition && available.length && item.claim.id === item.head_id"
         class="world-filter"
         @submit.prevent="link"
       >
@@ -402,6 +440,21 @@ onBeforeUnmount(() => {
       </form>
     </section>
     <section class="panel world-panel">
+      <p v-if="item.disposition">{{ dispositionNames[item.disposition.state] || item.disposition.state }} · {{ item.disposition.reason }}
+        <a v-if="item.disposition.target" :href="route(item.disposition.target)">打开合并后的条目</a></p>
+      <details v-else-if="!item.demo && item.claim.id === item.head_id">
+        <summary>处理争议、撤回或合并</summary>
+        <p v-for="d in item.disputes" :key="d.id">{{ d.field }} · {{ d.proposed }} · {{ d.resolution || d.reason }}
+          <button v-if="d.state === 'open'" class="btn" :disabled="saving || !change.fragment || change.reason.trim().length < 2" @click="recordChange(d.id)">按下方依据结案</button></p>
+        <form class="world-filter" @submit.prevent="recordChange()">
+          <label>操作<select v-model="change.state"><option value="withdrawn">撤回</option><option value="merged">合并</option></select></label>
+          <label v-if="change.state === 'merged'">目标条目编号<input v-model.number="change.target" type="number" min="1" required /></label>
+          <label v-if="change.state === 'merged'">目标版本编号<input v-model.number="change.targetVersion" type="number" min="1" required /></label>
+          <label>依据片段编号<input v-model.number="change.fragment" type="number" min="1" required /></label>
+          <label>处理理由<input v-model="change.reason" required minlength="2" maxlength="400" /></label>
+          <button class="btn" :disabled="saving">提交{{ change.state === 'merged' ? '合并' : '撤回' }}</button>
+        </form>
+      </details>
       <h2>修订历史</h2>
       <p v-for="v in item.history" :key="v.id">
         <a :href="route(item.id, v.id)">版本 {{ v.version }}</a> · {{ stamp(v.created_at, true) }} ·

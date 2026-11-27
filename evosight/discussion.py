@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 import re
 
-from . import focus, people, scenarios, workflow, world_search, workspace_agent
-from .db import dump, enqueue, one, require, rows, utc
+from . import agent_tools, feeds, focus, people, scenarios, workflow, world_search, workspace_agent
+from .db import config, dump, enqueue, one, require, rows, utc
 
 
 def allow_workspace_turns(c):
@@ -108,12 +108,6 @@ def attach_scenario(c, rec):
 def check_scope(revision, basis):
     if basis not in ("original", "latest") or (not revision and basis == "original"):
         raise ValueError("按当时资料讨论需要指定本事件的概率版本")
-
-
-def default_provider(rec):
-    if rec and (rec["model"].startswith("gpt-") or rec["model"].startswith("o3")):
-        return "codex"
-    return "dsh"
 
 
 def add_source(sources, key, period, **fields):
@@ -549,19 +543,17 @@ def submit(c, event, revision, basis, provider, question, nonce, timezone=None, 
     question = question.strip()
     if not question or len(question) > 2400:
         raise ValueError("请填写 1 至 2400 字的问题")
-    provider = default_provider(rec) if provider == "auto" else provider
-    if provider not in ("codex", "dsh"):
+    if provider not in ("auto", "codex", "dsh"):
         raise ValueError("未知的讨论后端")
     prior = one(c, "SELECT * FROM discussion_turns WHERE event_id IS ? AND nonce=?", (event, nonce))
     if prior:
-        if (prior["revision_id"], prior["basis"], prior["provider"], prior["question"]) != (
-            revision,
-            basis,
-            provider,
-            question,
+        if (prior["revision_id"], prior["basis"], prior["question"]) != (revision, basis, question) or (
+            provider != "auto" and prior["provider"] != provider
         ):
             raise ValueError("该提交编号已用于另一个问题")
         return {"turn_id": prior["id"], "job_id": prior["job_id"]}
+    if provider == "auto":
+        provider = workflow.main_session_backend(c, event) or config(c)["agent_backend"]
     if one(
         c,
         """SELECT 1 FROM discussion_turns t JOIN jobs j ON j.id=t.job_id WHERE t.event_id IS ?
@@ -570,6 +562,11 @@ def submit(c, event, revision, basis, provider, question, nonce, timezone=None, 
     ):
         raise ValueError("上一条提问仍在处理中，收到回答后可以继续追问")
     ctx, snap = build_context(c, event, rec, basis, question)
+    c.execute(
+        """INSERT INTO agent_sessions(lane,backend) VALUES(?,?)
+           ON CONFLICT(lane) DO UPDATE SET backend=excluded.backend""",
+        (workflow.main_lane(event), provider),
+    )
     ctx["timezone"] = timezone
     ctx["utc_offset_minutes"] = utc_offset_minutes
     ident = c.execute(
@@ -631,7 +628,8 @@ def conversation(c, event, revision, basis, before=0):
     return {
         "anchor": rec,
         "basis": basis,
-        "default_provider": default_provider(rec),
+        "default_provider": config(c)["agent_backend"],
+        "session_provider": workflow.main_session_backend(c, event),
         "turns": list(reversed(page)),
         "has_older": len(turns) > 20,
     }
@@ -663,7 +661,36 @@ def retry(c, job):
     return job["id"]
 
 
+def retrieve_web_sources(acquisition, ctx, urls):
+    """Freeze retrieved publisher text with the turn, including global chats without an event."""
+    result = {**ctx, "sources": dict(ctx["sources"]), "web_lookup": []}
+    for url in dict.fromkeys(urls):
+        found = acquisition.targeted(feeds.public_url(url))
+        if not found:
+            result["web_lookup"].append({"url": url, "result": "未取回可引用的原文"})
+            continue
+        entry, response, extracted = found[0]
+        key = f'W{len(result["web_lookup"]) + 1}'
+        add_source(
+            result["sources"], key, "latest", title=entry["title"] or response.url,
+            href=response.url, url=response.url, published_at=extracted.published_at, retrieved_at=utc(),
+            text="\n".join(p[1] for p in extracted.parts)[:12000],
+        )
+        result["web_lookup"].append({"url": url, "key": key})
+    return result
+
+
 def validate_answer(answer, ctx):
+    if answer.kind == "lookup" or answer.source_urls:
+        if (
+            answer.kind != "lookup" or not answer.source_urls or answer.actions or answer.add_focus
+            or answer.citations or ctx.get("basis") != "latest" or "web_lookup" in ctx
+            or not agent_tools.live_web("discuss_codex", ctx)
+        ):
+            raise ValueError("本轮仅能在最新资料对话中提交一次公开原文取证请求")
+        for url in answer.source_urls:
+            feeds.public_url(url)
+        return
     if answer.kind == "workflow" or answer.actions:
         if (
             answer.kind != "workflow"
@@ -694,6 +721,8 @@ def validate_answer(answer, ctx):
 
 def save_answer(c, turn, run, answer, ctx):
     validate_answer(answer, ctx)
+    if answer.kind == "lookup":
+        raise ValueError("请先取得原文再交付讨论答复")
     if answer.kind == "workflow":
         body = workspace_agent.execute(c, turn, ctx, answer.actions)
     elif answer.kind == "tracking":

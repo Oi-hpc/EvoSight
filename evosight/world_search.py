@@ -5,11 +5,12 @@ import math
 import re
 
 from . import world_catalog as catalog
+from . import cards
 from .db import dump, one, require, rows
 
 STOP = {"追踪", "跟踪", "是否", "本次", "事件", "情况", "相关", "核对", "最新", "以及", "研究", "公告", "the", "and"}
 KINDS = {"fact", "reported", "view", "hypothesis", "relation", "correction", "conflict"}
-INDEX_FORMAT = 3
+INDEX_FORMAT = 4
 
 
 def terms(text):
@@ -55,6 +56,7 @@ def index_head(c, entry):
     w = require(c, "world_entries", entry)
     k = require(c, "claims", w["head_id"])
     data = one(c, "SELECT path,attributes FROM world_record_data WHERE version_id=?", (k["id"],))
+    fields, _ = cards.read(c, k["id"], json.loads(data["attributes"]))
     path = data["path"]
     c.execute(
         """INSERT INTO world_catalog_members(entry_id,head_id,demo,path,entity_id,kind,occurred_at,recorded_at,index_format)
@@ -92,7 +94,7 @@ def index_head(c, entry):
     for text, weight in (
         (k["text"], 2),
         (" ".join(path_words), 4),
-        (" ".join(str(v) for v in json.loads(data["attributes"]).values()), 6),
+        (" ".join(str(v) for v in fields.values()), 6),
         (" ".join((label, *aliases)), 9),
         (k["subject"], 12),
         (" ".join(names), 14),
@@ -101,7 +103,7 @@ def index_head(c, entry):
             weights[token] = weight
     weights["=" + catalog.normalize(k["subject"])] = 32
     category = path.partition("/")[0]
-    for key, value in json.loads(data["attributes"]).items():
+    for key, value in fields.items():
         weights[catalog.qualifier_token(category, key, value)] = 1
     c.execute("DELETE FROM world_terms WHERE entry_id=?", (entry,))
     c.executemany(
@@ -117,6 +119,12 @@ def repair(c):
                        LEFT JOIN world_record_data d ON d.version_id=v.claim_id WHERE d.version_id IS NULL ORDER BY v.claim_id""",
     ):
         record_version(c, v["claim_id"], v["category"])
+    for item in rows(
+        c,
+        """SELECT d.version_id FROM world_record_data d LEFT JOIN card_provenance p ON p.version_id=d.version_id
+                         WHERE p.version_id IS NULL""",
+    ):
+        cards.refresh(c, item["version_id"])
     for row in c.execute(
         """SELECT w.id FROM world_entries w LEFT JOIN world_catalog_members m ON m.entry_id=w.id
                             WHERE m.head_id IS NULL OR m.head_id!=w.head_id OR m.index_format!=?""",
@@ -130,7 +138,9 @@ def directory(c, path="", demo=0):
     direct = {
         r[0]: r[1]
         for r in c.execute(
-            "SELECT path,count(*) FROM world_catalog_members WHERE demo=? GROUP BY path", (demo,)
+            """SELECT path,count(*) FROM world_catalog_members m WHERE demo=?
+               AND NOT EXISTS(SELECT 1 FROM world_dispositions d WHERE d.entry_id=m.entry_id) GROUP BY path""",
+            (demo,),
         )
     }
     totals = {}
@@ -192,6 +202,7 @@ def candidate_query(
     path="",
     kind="",
     entity_id=None,
+    entry_id=None,
     occurred_from="",
     occurred_to="",
     qualifiers=None,
@@ -199,8 +210,11 @@ def candidate_query(
     event=None,
     discovery=False,
 ):
-    conditions = ["m.demo=?"]
+    conditions = ["m.demo=?", "NOT EXISTS(SELECT 1 FROM world_dispositions d WHERE d.entry_id=m.entry_id)"]
     args = [demo]
+    if entry_id is not None:
+        conditions.append("m.entry_id=?")
+        args.append(entry_id)
     if qualifiers is not None:
         for term in catalog.qualifier_terms(path, qualifiers):
             conditions.append("m.entry_id IN (SELECT entry_id FROM world_terms WHERE term=?)")
@@ -299,6 +313,16 @@ def read_records(c, requests, fields=(), evidence=False, *, demo=0):
     result = []
     for requested in requests:
         entry, revision = requested["entry_id"], requested.get("version_id") or None
+        if not revision:
+            state = one(
+                c,
+                """SELECT d.state,d.target FROM world_dispositions d JOIN world_entries w ON w.id=d.entry_id
+                              WHERE w.demo=? AND d.entry_id=?""",
+                (demo, entry),
+            )
+            if state:
+                result.append({**requested, "status": state["state"], "target": state["target"]})
+                continue
         row = one(
             c,
             """SELECT w.id AS entry_id,k.id AS version_id,v.version,d.schema_id,d.schema_version,d.path,d.attributes,
@@ -311,7 +335,7 @@ def read_records(c, requests, fields=(), evidence=False, *, demo=0):
         if not row:
             result.append({**requested, "status": "not_found"})
             continue
-        values = json.loads(row["attributes"])
+        values, proof = cards.read(c, row["version_id"], json.loads(row["attributes"]))
         known = catalog.SCHEMA_FIELDS[row["schema_id"]]
         row["attributes"] = {k: v for k, v in values.items() if not fields or k in fields}
         row["missing_fields"] = [k for k in fields if k in known and k not in values]
@@ -320,6 +344,21 @@ def read_records(c, requests, fields=(), evidence=False, *, demo=0):
         row["refs"] = json.loads(row["refs"])
         row.update(status="ok", evidence_count=len(cites), source_document_count=len(set(row["refs"])))
         if evidence:
+            row["card_evidence"] = {k: v for k, v in proof.items() if not fields or k in fields}
             row["citations"] = cites[:4]
+            row["field_evidence"] = [
+                ref
+                for ref in rows(
+                    c,
+                    """SELECT field,fragment_id,quote FROM field_evidence
+                                  WHERE version_id=? ORDER BY field,fragment_id""",
+                    (row["version_id"],),
+                )
+                if (not fields or ref["field"].removeprefix("attributes.") in fields)
+                and (
+                    ref["field"].removeprefix("attributes.") not in cards.CARD_FIELDS
+                    or ref["field"].removeprefix("attributes.") in values
+                )
+            ]
         result.append(row)
     return result

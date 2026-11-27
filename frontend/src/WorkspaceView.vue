@@ -42,6 +42,11 @@ const defaults = [
   ['watch_minutes', '新闻巡检间隔（分钟）'],
   ['watch_sources', '每事件自动巡检入口数'],
 ] as const
+const activeProfiles = computed(() => {
+  if (!op.value) return {}
+  const { discuss_codex, discuss_dsh, ...roles } = op.value.profiles
+  return { ...roles, discussion: op.value.limits.agent_backend === 'dsh' ? discuss_dsh : discuss_codex }
+})
 let seq = 0
 async function load() {
   const ticket = ++seq
@@ -329,17 +334,29 @@ const shown = computed(
       <div>
         <p class="eyebrow">工作台配置</p>
         <h1>设置</h1>
-        <p class="subtitle">配置调用额度、追踪容量和自动调度。</p>
+        <p class="subtitle">配置 Agent 后端、调用额度和自动调度。</p>
       </div>
     </header>
     <div v-if="op && limits" class="split">
       <form class="panel" @submit.prevent="action('/settings', limits, '设置已保存')">
         <div class="panel-head">
-          <h2><Settings2 />运行额度</h2>
+          <h2><Settings2 />模型与运行额度</h2>
           <small>按 UTC 归日、归月</small>
         </div>
         <p class="scope spaced">额度按模型调用次数计算，包含已发出的失败请求。</p>
         <div class="form-grid">
+          <label class="field"><span>其他新会话默认 Agent 后端</span>
+            <select v-model="limits.agent_backend">
+              <option value="codex">Codex</option>
+              <option value="dsh">DSH / Kimi</option>
+            </select>
+          </label>
+          <label class="field"><span>新建新闻侦查 Agent 默认后端</span>
+            <select v-model="limits.news_agent_backend" aria-describedby="news-search-capability">
+              <option value="dsh">DSH / Kimi</option>
+              <option value="codex">Codex</option>
+            </select>
+          </label>
           <label v-for="[key, name] in defaults" :key="key" class="field"
             ><span>{{ name }}</span
             ><input
@@ -356,6 +373,10 @@ const shown = computed(
               required
           /></label>
         </div>
+        <p id="news-search-capability" class="scope spaced">
+          DSH 可使用内置网页搜索和 EvoSight 搜索。当前 KPRSI 配置下 Codex 原生网页搜索不可用，可使用 EvoSight 搜索。
+          默认后端设置应用于新建会话，已有会话按各自的后端续接。
+        </p>
         <p v-if="op.concurrency" class="scope spaced">
           当前可同时运行 {{ op.concurrency.effective }} 个 Agent。调度器按 CPU
           和可用内存调整，并预留 {{ op.concurrency.reserve_mib }} MiB。
@@ -369,10 +390,10 @@ const shown = computed(
       </form>
       <aside class="panel">
         <div class="panel-head">
-          <h2><Database />当前模型配置</h2>
+          <h2><Database />新会话默认模型</h2>
           <span class="tag">{{ op.mode === 'test' ? '测试' : '正式' }}</span>
         </div>
-        <div v-for="(v, k) in op.profiles" :key="k" class="rail-item">
+        <div v-for="(v, k) in activeProfiles" :key="k" class="rail-item">
           <strong>{{ label(k) }}</strong><small>{{ v[0] }} · {{ v[1] }}</small>
         </div>
         <p class="rail-item">

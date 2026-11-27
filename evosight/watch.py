@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from . import feeds, materials, resources, workflow
-from .db import DispatchDeferred, config, dump, later, one, require, rows, utc
+from .db import DispatchDeferred, config, dump, enqueue, later, one, require, rows, utc
 from .materials import Source, relevance, safe_link
 
 log = logging.getLogger("evosight.watch")
@@ -366,7 +366,37 @@ class Watcher:
                     (event,),
                 )
                 reason = "重大公告" if action == "full" else "局部线索"
-                if previous and previous["seen_at"] >= later(-1800) and action == "local":
+                guides = (
+                    rows(
+                        c,
+                        """SELECT * FROM event_guides WHERE event_id=? AND active
+                              AND goal_version=(SELECT max(version) FROM event_goals WHERE event_id=?)""",
+                        (event, event),
+                    )
+                    if action == "local"
+                    else []
+                )
+                if guides:
+                    for guide in guides:
+                        query = json.loads(guide["query"])
+                        if (
+                            relevance(
+                                query.get("query", ""), guide["question"], title + " " + art["summary"][:250]
+                            )
+                            < 3
+                        ):
+                            continue
+                        enqueue(
+                            c,
+                            "guide_check",
+                            event=event,
+                            args={
+                                "guide_id": guide["id"],
+                                "document_id": row["document_id"],
+                                "dispatch_key": f"signal/{guide['id']}/{signal_key}",
+                            },
+                        )
+                elif previous and previous["seen_at"] >= later(-1800) and action == "local":
                     action = "store"
                 else:
                     rid, _ = workflow.request_round(c, event, reason, key="signal/" + signal_key)

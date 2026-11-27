@@ -64,6 +64,7 @@ interface Conversation {
     snapshot_id: number | null
   } | null
   default_provider: string
+  session_provider: string | null
   basis: string
   turns: Turn[]
   has_older: boolean
@@ -82,8 +83,7 @@ const question = ref(''),
   error = ref(''),
   saving = ref(false)
 const field = ref<HTMLTextAreaElement>(),
-  conversationLog = ref<HTMLElement>(),
-  lastQuestion = ref<HTMLElement>()
+  conversationLog = ref<HTMLElement>()
 interface Archive {
   id: number
   model: string
@@ -100,6 +100,12 @@ const busy = computed(() =>
   )
 )
 const anchor = computed(() => state.value?.anchor)
+const switchingBackend = computed(
+  () =>
+    state.value?.session_provider &&
+    provider.value !== 'auto' &&
+    provider.value !== state.value.session_provider
+)
 const suggestions = computed(() =>
   anchor.value?.scenario_label
     ? ['为何把这一档作为主情景？', '哪些反向证据会改变力度或判断信心？']
@@ -144,6 +150,7 @@ async function openArchive(e: Event) {
   }
 }
 function sourceLabel(c: Citation) {
+  if (/^W\d+$/.test(c.key)) return '本次讨论取回的原文'
   if (!props.revisionId) return ''
   return c.period.length === 2
     ? '当时及当前'
@@ -151,7 +158,7 @@ function sourceLabel(c: Citation) {
       ? '登记当时'
       : '提问时收录'
 }
-async function load(before = 0) {
+async function load(before = 0, followLatest = false) {
   const seq = ++fetching
   clearTimeout(timer)
   try {
@@ -159,6 +166,7 @@ async function load(before = 0) {
     if (!alive || seq !== fetching) return
     const log = conversationLog.value
     const priorHeight = log?.scrollHeight || 0
+    const priorTop = log?.scrollTop || 0
     const nearEnd = !log || log.scrollHeight - log.scrollTop - log.clientHeight < 60
     state.value = data
     // Preserve older pages while polling the latest pending turn.
@@ -168,11 +176,11 @@ async function load(before = 0) {
       older.value = data.has_older
     turns.value = [...known.values()].sort((a, b) => a.id - b.id)
     error.value = ''
-    if (!props.eventId) {
-      await nextTick()
-      const updated = conversationLog.value
-      if (updated && before) updated.scrollTop += updated.scrollHeight - priorHeight
-      else if (updated && nearEnd) updated.scrollTop = updated.scrollHeight
+    await nextTick()
+    const updated = conversationLog.value
+    if (updated) {
+      if (before) updated.scrollTop = priorTop + updated.scrollHeight - priorHeight
+      else if (followLatest || nearEnd) updated.scrollTop = updated.scrollHeight
     }
   } catch (e) {
     if (alive && seq === fetching) error.value = (e as Error).message
@@ -196,14 +204,16 @@ async function load(before = 0) {
   }
 }
 async function send() {
-  const q = question.value.trim()
+  const draft = question.value
+  const q = draft.trim()
   if (!q || busy.value || saving.value) return
   saving.value = true
+  const selectedProvider = provider.value
   const prior = request
   request =
-    prior && prior.question === q && prior.provider === provider.value
+    prior && prior.question === q && prior.provider === selectedProvider
       ? prior
-      : { question: q, provider: provider.value, nonce: crypto.randomUUID() }
+      : { question: q, provider: selectedProvider, nonce: crypto.randomUUID() }
   try {
     await api(base, {
       ...request,
@@ -214,17 +224,20 @@ async function send() {
     })
     if (!alive) return
     request = null
-    question.value = ''
-    await load()
-    await nextTick()
-    if (!props.eventId && conversationLog.value)
-      conversationLog.value.scrollTop = conversationLog.value.scrollHeight
-    else lastQuestion.value?.scrollIntoView({ block: 'nearest' })
+    if (question.value === draft) question.value = ''
+    await load(0, true)
+    if (provider.value === selectedProvider && state.value?.session_provider === selectedProvider)
+      provider.value = 'auto'
   } catch (e) {
     if (alive) error.value = (e as Error).message
   } finally {
     saving.value = false
   }
+}
+function onEnter(event: KeyboardEvent) {
+  if (event.shiftKey || event.isComposing || event.keyCode === 229) return
+  event.preventDefault()
+  if (!event.repeat) void send()
 }
 async function retry(t: Turn) {
   saving.value = true
@@ -248,7 +261,7 @@ onBeforeUnmount(() => {
 })
 </script>
 <template>
-  <div class="discussion-pane" :class="{ 'workspace-discussion': !eventId }">
+  <div class="discussion-pane">
     <div v-if="error" class="error" role="alert">
       {{ error }} <button class="btn quiet" @click="load()">刷新</button>
     </div>
@@ -269,7 +282,6 @@ onBeforeUnmount(() => {
           <p v-if="!eventId" class="meta">
             查看各事件的进展，用对话新建或修改跟踪、调整周期、安排研究。
           </p>
-          <a v-else-if="!demo" class="backlink" href="#/agent"><MessagesSquare />全局 Agent</a>
           <p v-if="anchor" class="meta">
             <strong class="probability">{{ anchor.scenario_label }} {{ anchor.p }}%</strong> ·
             {{ anchor.model }} ·
@@ -277,19 +289,22 @@ onBeforeUnmount(() => {
           </p>
           <p v-if="demo" class="meta">此讨论使用虚构演示事件的资料。</p>
         </div>
-        <div v-if="revisionId" class="discussion-scope" aria-label="讨论资料范围">
-          <a
-            :href="scopeLink(false)"
-            :aria-current="!latest ? 'page' : undefined"
-            :class="{ selected: !latest }"
-            ><Target />登记当时</a
-          >
-          <a
-            :href="scopeLink(true)"
-            :aria-current="latest ? 'page' : undefined"
-            :class="{ selected: latest }"
-            ><BookOpen />结合最新</a
-          >
+        <div v-if="eventId && (!demo || revisionId)" class="discussion-tools">
+          <a v-if="!demo" class="backlink" href="#/agent"><MessagesSquare />全局 Agent</a>
+          <div v-if="revisionId" class="discussion-scope" aria-label="讨论资料范围">
+            <a
+              :href="scopeLink(false)"
+              :aria-current="!latest ? 'page' : undefined"
+              :class="{ selected: !latest }"
+              ><Target />登记当时</a
+            >
+            <a
+              :href="scopeLink(true)"
+              :aria-current="latest ? 'page' : undefined"
+              :class="{ selected: latest }"
+              ><BookOpen />结合最新</a
+            >
+          </div>
         </div>
       </header>
       <details v-if="anchor?.run_id" class="discussion-archive" @toggle="openArchive">
@@ -305,34 +320,33 @@ onBeforeUnmount(() => {
           </details>
         </template>
       </details>
-      <div v-if="older" class="toolbar">
-        <button class="btn quiet" @click="load(turns[0].id)">查看更早的讨论</button>
-      </div>
-      <div v-if="!turns.length" class="discussion-start">
-        <MessagesSquare />
-        <div>
-          <h3>
-            {{
-              anchor
-                ? latest
-                  ? '用新进展重新审视这版预测'
-                  : '从这版概率的依据问起'
-                : '从你关心的变化问起'
-            }}
-          </h3>
-          <div class="discussion-prompts">
-            <button v-for="s in suggestions" :key="s" @click="suggest(s)">{{ s }}</button>
-          </div>
-        </div>
-      </div>
       <div
-        v-else
         ref="conversationLog"
         class="discussion-log"
         role="region"
         aria-label="讨论记录"
-        :tabindex="eventId ? undefined : 0"
+        tabindex="0"
       >
+        <div v-if="older" class="toolbar">
+          <button class="btn quiet" @click="load(turns[0].id)">查看更早的讨论</button>
+        </div>
+        <div v-if="!turns.length" class="discussion-start">
+          <MessagesSquare />
+          <div>
+            <h3>
+              {{
+                anchor
+                  ? latest
+                    ? '用新进展重新审视这版预测'
+                    : '从这版概率的依据问起'
+                  : '从你关心的变化问起'
+              }}
+            </h3>
+            <div class="discussion-prompts">
+              <button v-for="s in suggestions" :key="s" @click="suggest(s)">{{ s }}</button>
+            </div>
+          </div>
+        </div>
         <article v-for="t in turns" :key="t.id" class="discussion-turn">
           <div class="discussion-question">
             <span class="eyebrow">你 · {{ stamp(t.created_at, true) }}</span>
@@ -438,58 +452,74 @@ onBeforeUnmount(() => {
         </article>
       </div>
       <form class="discussion-compose" @submit.prevent="send">
-        <label for="discussion-question">你的问题</label>
-        <textarea
-          id="discussion-question"
-          ref="field"
-          v-model="question"
-          maxlength="2400"
-          rows="3"
-          :placeholder="
-            eventId
-              ? '询问证据、追问判断，或给当前事件安排跟踪任务…'
-              : '询问各事件进展，或说「把某个事件改为每四小时跟踪一次」…'
-          "
-          @keydown.ctrl.enter.prevent="send"
-          @keydown.meta.enter.prevent="send"
-        />
-        <div class="discussion-compose-actions">
-          <label
-            >回答 Agent
+        <div class="discussion-compose-heading">
+          <label for="discussion-question">向{{ eventId ? '事件' : '工作台' }}主 Agent 提问</label>
+          <label class="discussion-provider"
+            >回答后端
             <select v-model="provider">
-              <option value="auto">自动 · {{ backend(state.default_provider) }}</option>
+              <option value="auto">
+                {{ state.session_provider ? '沿用会话' : '新会话默认' }} ·
+                {{ backend(state.session_provider || state.default_provider) }}
+              </option>
               <option value="codex">Codex</option>
               <option value="dsh">dsh / Kimi</option>
             </select></label
           >
+        </div>
+        <div class="discussion-input-row">
+          <textarea
+            id="discussion-question"
+            ref="field"
+            v-model="question"
+            maxlength="2400"
+            rows="2"
+            enterkeyhint="send"
+            aria-describedby="discussion-hint"
+            :placeholder="
+              eventId
+                ? '询问证据、追问判断，或给当前事件安排跟踪任务…'
+                : '询问各事件进展，或说「把某个事件改为每四小时跟踪一次」…'
+            "
+            @keydown.enter="onEnter"
+          />
           <button class="btn primary" type="submit" :disabled="!question.trim() || busy || saving">
             <Send />{{ busy ? '等待上一条回答' : '发送' }}
           </button>
         </div>
-        <small class="meta"
-          ><CornerDownLeft /> Ctrl / ⌘ + Enter 发送。讨论中的概率推演单独保存在对话里。</small
-        >
+        <small id="discussion-hint" class="meta">
+          <CornerDownLeft />
+          <span>Enter 发送，Shift + Enter 换行。{{
+            switchingBackend
+              ? '更换后端只能带入已保存的问答和材料，建议沿用当前会话。'
+              : '讨论中的概率推演单独保存在对话里。'
+          }}</span>
+        </small>
       </form>
-      <div ref="lastQuestion"></div>
     </template>
   </div>
 </template>
 
 <style scoped>
 .discussion-pane {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+  width: 100%;
   max-width: 940px;
   margin: 0 auto;
 }
-.workspace-discussion .discussion-log {
-  max-height: clamp(155px, calc(100dvh - 430px), 780px);
+.discussion-log {
+  flex: 1 0 auto;
+  height: 10rem;
   overflow-y: auto;
+  overflow-anchor: none;
   overscroll-behavior-y: contain;
   scrollbar-gutter: stable;
   padding-right: 6px;
 }
 .discussion-archive {
-  padding: 8px 14px;
-  margin-bottom: 12px;
+  padding: 5px 14px;
+  margin-bottom: 8px;
   background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -517,8 +547,18 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
-  gap: 18px;
-  margin-bottom: 15px;
+  gap: 8px 16px;
+  padding-block: 10px;
+  margin-bottom: 8px;
+}
+.discussion-head .backlink {
+  margin-bottom: 0;
+}
+.discussion-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
 }
 .discussion-head h2,
 .discussion-start h3,
@@ -632,30 +672,37 @@ onBeforeUnmount(() => {
 }
 .discussion-compose {
   display: grid;
-  gap: 9px;
-  margin-top: 14px;
+  gap: 6px;
+  padding: 10px clamp(12px, 2vw, 18px);
+  margin-top: 8px;
+}
+.discussion-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
 }
 .discussion-compose textarea {
   width: 100%;
   resize: vertical;
-  min-height: 75px;
+  min-height: 4rem;
   border: 1px solid var(--line);
   border-radius: 7px;
   padding: 9px 11px;
   color: var(--ink);
 }
-.discussion-compose-actions,
-.discussion-compose-actions label,
+.discussion-compose-heading,
+.discussion-provider,
 .discussion-compose small {
   display: flex;
   align-items: center;
   gap: 8px;
 }
-.discussion-compose-actions {
+.discussion-compose-heading {
   justify-content: space-between;
   flex-wrap: wrap;
 }
-.discussion-compose-actions label {
+.discussion-provider {
   font-size: 0.85rem;
   color: var(--sub);
 }

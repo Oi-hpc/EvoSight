@@ -10,10 +10,10 @@ EvoSight 是本地单用户事件研究工作台。首页回答“我上次读�
 
 ```powershell
 if (Test-Path .\.work\media-tools\enable.ps1) { . .\.work\media-tools\enable.ps1 }
-.\.venv\Scripts\python.exe -m evosight serve --mode live --demo
+.\.venv\Scripts\python.exe -m evosight serve --mode live
 ```
 
-当前工作区的数据库保存了一次低强度真实试跑。打开“Vue 核心版本发布观察”可查看 GitHub 官方发布订阅、Kimi 的判断和 Codex 登记的预测。这个事件已暂停常规采集。点“恢复追踪”即可继续。已登记的真实预测到期后仍会进入核验队列。设置中的“全局暂停调度”可以暂停后台调用。
+首次启动时工作台为空。可以从首页新建追踪，也可以在全局 Agent 对话里指定事件和研究目标。后续启动会续用本地数据库。
 
 `--demo` 添加两条相关的虚构交通事件，用于体验共享来源、两轮判断、概率修订和已结算案例。演示事件跳过自动追踪。主动向演示事件提问会调用所选模型。评测页单独统计真实题。重复启动会保留原先的数据。
 
@@ -29,7 +29,7 @@ X 支持公开帖子嵌入。在服务进程配置有相应读取权限的 `EVOS
 
 进入 **设置 → Agent 最大并发** 可选择 1 至 4，默认 2。**运行记录** 显示配置值、当前允许并发、正在调用的数量与可用内存。两核主机最多同时运行两个模型调用，可用内存下降或 CPU 持续繁忙时自动收紧。调度器按每个 Agent 320 MiB 估算，并为系统预留 320 MiB。
 
-同轮的独立研究角色可以并行，讨论可以与后台研究同时进行。规划完成才派发角色，所有已派发角色结束后统一综合并发布。模型名额、日月额度及核验预留在同一数据库事务内分配，等待期间可以继续阅读工作台。
+同轮的独立调查线可以并行，一个执行槽空出即可派下一项。主 Agent 按事件延续会话，侦查 Agent 按调查线延续会话，同一会话的请求串行。轮次综合后，失败的调查线可按任务单独补做。模型名额、日月额度及核验预留在同一数据库事务内分配。
 
 ## 分级趋势预测
 
@@ -49,13 +49,15 @@ X 支持公开帖子嵌入。在服务进程配置有相应读取权限的 `EVOS
 
 在事件页点 **和 Agent 讨论**，可以问近期进展、舆情或证据缺口。系统带入事件目标、提问时的知识索引、相关条目的固定版本、原文片段、近期时间线和已登记预测。点 **相关预测 → 概率历史 → 讨论这版概率**，可以针对某一次判断追问。**登记当时** 和 **结合最新** 各自保留讨论记录。回答中的引用可打开具体材料、引文位置、知识版本或概率版本。
 
-预测讨论默认沿用原预测的后端，事件讨论默认使用 dsh / Kimi。每次提问可选择 Codex 或 dsh，在同一资料范围内切换会带上最近六轮已完成问答。测试使用 low，正式使用 max。每条提问入队，采集暂停后仍可讨论，模型额度和核验预留与工作台共用。
+全局讨论续接工作台主 Agent。事件讨论和按最新资料讨论预测共用事件主 Agent。按登记当时讨论预测会单独打开历史快照。三个入口都可以在记录区内滚动，用 Enter 发送、Shift + Enter 换行。新会话默认使用 Codex，也可显式选择 DSH。开始后建议沿用已选后端，以保留原生会话上下文。手动切换后，该主会话后续沿用新选择，交接依靠已保存的问答、材料和检查点。已入队的提问及重试沿用提交时选定的后端。讨论共用工作台的调用额度和核验预留。
+
+Codex 在查源、侦查和最新资料讨论中可调用 EvoSight 的只读 `search_public_web`，由后台回访并归档选中的原文。模型继续使用配置的提供方。接入支持 Codex 原生搜索的提供方时，可在启动工作台前设置 `EVOSIGHT_CODEX_SEARCH=native`。报告定稿、预测登记、按登记当时讨论、盲审及到期裁决使用指定证据集。Windows 通过 MXC 隔离检测后开放只读研究 shell。[按任务划分的工具权限](docs/多Agent协作与知识库优化方案.md#codex-的实际工具权限)
 
 有归档的预测可展开查看原始结构化输入和登记理由。早期或人工版本使用保存下来的概率、判定规则、引文和书面理由。讨论中的情景推演保存在对话记录中。正式修订仍从概率历史登记。[开发规划](docs/持续预测工作流开发规划.md) · [真实讨论验收](docs/工作流初版验收记录.md#人机讨论)
 
 ## 首次安装
 
-需要 Python 3.11 及以上、Node.js 22.12 及以上，以及已有可用配置的 DSH、CANNBot 服务和 Codex CLI。本机用 Windows 原生 Python 3.14 和 Node 24 完成联调。
+运行需要 Python 3.11 及以上、Node.js 22.12 及以上和已配置的 Codex CLI。新闻侦查默认使用 DSH，需要 DSH 和 CANNBot 配置，也可在设置中切换为 Codex。本机用 Windows 原生 Python 3.14 和 Node 24 完成联调。
 
 ```powershell
 python -m venv .venv
@@ -69,16 +71,24 @@ Pop-Location
 
 FastAPI 同时提供静态页面和 API。开发界面时，可在另一个终端的 `frontend` 目录运行 `npm.cmd run dev` 使用 Vite 热更新，其 API 代理指向 8765。服务和 worker 在同一进程内运行，关闭终端会停止调度。SQLite 数据默认放在 `data/evosight.sqlite3`。可用 `--data` 选择另一个数据目录，用 `--port` 更改端口。
 
+Linux 服务器的运行目录、发布、热更新和回滚流程见 [Linux 服务器发布](docs/Linux服务器发布.md)。
+
 ## 模型配置
 
-| 工作 | 测试模式 test | 正式模式 live |
+| 后端 | 测试模式 test | 正式模式 live |
 | --- | --- | --- |
-| 前置探索、八个研究角色、认知整理和主题发现 | CANNBot / dashscope/kimi-k3.1-pro · low | CANNBot / dashscope/kimi-k3.1-pro · max |
-| 二元及分级预测、核验复盘 | Codex / gpt-6.2-sol · low | Codex / gpt-6.2-astra · max |
+| Codex（默认） | gpt-6.2-sol · low | gpt-6.2-astra · max |
+| DSH（可选） | dashscope/kimi-k3.1-pro · low | dashscope/kimi-k3.1-pro · max |
 
-`serve` 默认采用 live。DSH 直接加载本机 `~/.dsh/profiles/desktop/cordis.patch.yml` 中的 CANNBot 配置，Windows 默认从 `D:\DSH` 启动。其他安装位置可设 `EVOSIGHT_DSH_DIR`。也可以通过 `EVOSIGHT_DSH_CLI` 指定可直接执行的 headless 程序，通过 `EVOSIGHT_DSH_PATCH` 指定本地配置文件。
+`serve` 默认采用 live。**设置 → 新建新闻侦查 Agent 默认后端** 默认是 DSH，可切换为 Codex。其他新会话默认使用 Codex，可在同页单独配置。已有主会话和侦查线继续使用各自选定的后端。研究实验可设 `EVOSIGHT_RESEARCH_BACKEND=codex` 或 `dsh`，在查源、发现、规划、侦查与综合首次建立研究会话时指定后端。
 
-Codex 以 `codex -p kprsi` 配置运行，应用显式传入模型和推理强度。`EVOSIGHT_CODEX_CLI` 可指向原生可执行文件。应用在隔离的临时目录传入本次研究需要的公开材料，读取结构化最终输出和返回的 token 用量。运行记录保存角色、模型、强度、耗时和状态。凭证由原 CLI 配置管理。
+Codex 以 `codex -p kprsi` 配置运行，`EVOSIGHT_CODEX_CLI` 可指定可执行文件。当前 KPRSI 配置下 Codex 原生网页搜索不可用，可用 EvoSight 搜索。两种后端共用任务队列、租约、重试、黑板和工作区管理。工作台数据库分别保存 Codex 和 DSH 的原生会话 ID，以及应用检查点。工作目录和 DSH 持久状态都在数据目录下的 `agent-workspaces`，各自的原生进程可按需退出和续接。
+
+DSH 加载本机 `~/.dsh/profiles/desktop/cordis.patch.yml` 中的 CANNBot 配置，Windows 默认从 `D:\DSH` 启动。其他安装位置可设 `EVOSIGHT_DSH_DIR`，也可以通过 `EVOSIGHT_DSH_CLI` 指定可执行的 headless 程序，通过 `EVOSIGHT_DSH_PATCH` 指定本地配置文件。
+
+允许联网的 DSH 任务优先用内置 `web_search`，缺少目标来源时可用 EvoSight 搜索补查。内置搜索使用 DeepSeek 凭据，来自启动环境的 `DEEPSEEK_API_KEY` 或本机 DSH 已保存的凭据。DSH 可以搜索并回读当前任务已授权的完整归档片段，引用校验仍使用归档原文。
+
+事件知识页展示查阅指南、候选版本和事件专属材料。侦查员可主动查本事件的归档、世界知识或公开来源，并向同伴交接。主 Agent 决定候选是否进入世界目录。固定预测、分级预测及修订会留下独立复核记录。详见[多 Agent 协作与知识库优化方案](docs/多Agent协作与知识库优化方案.md)。
 
 ## 从一条事件开始
 

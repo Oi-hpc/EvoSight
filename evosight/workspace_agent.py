@@ -131,7 +131,25 @@ def command_question(ctx):
 def check_command(ctx, action):
     q = command_question(ctx)
     instruction = action.instruction
+    if isinstance(action, CancelRun):
+        matching = [
+            part.strip()
+            for part in re.split(r"[。！？!?；;\n]", q)
+            if re.search(INTENT[action.action], part, re.I)
+            and re.search(rf"(?:#|任务\s*#?\s*){action.job_id}(?!\d)", part)
+        ]
+        if len(matching) != 1:
+            raise ValueError("请在一条取消指令中给出相应的定时任务编号。")
+        instruction = action.instruction = matching[0]
     at = q.find(instruction)
+    if at < 0 and ctx.get("workspace"):
+        clauses = [
+            s.strip() for s in re.split(r"[。！？!?；;\n]", q) if re.search(INTENT[action.action], s, re.I)
+        ]
+        if len(clauses) == 1:
+            instruction = clauses[0]
+            at = q.find(instruction)
+            action.instruction = instruction
     if not ctx.get("workspace") or at < 0:
         raise ValueError("请在当前消息中明确说明要执行的操作。")
     surrounding = re.split(r"[。！？!?\n]", q[:at])[-1] + instruction
@@ -147,7 +165,8 @@ def check_command(ctx, action):
         raise ValueError("本条消息有否定或互相冲突的指令，请说明要执行哪一项。")
     if action.action == "pause_focus" and re.search(r"(?:不要|勿|别|不必)(?:再)?(?:暂停|停止|取消|移出)", surrounding):
         raise ValueError("请确认是否要暂停这项收集。")
-    if action.event_ref not in REFERENCE and norm(action.event_ref) not in norm(q):
+    target_clause = instruction if isinstance(action, CancelRun) else q
+    if action.event_ref not in REFERENCE and norm(action.event_ref) not in norm(target_clause):
         raise ValueError("事件指代必须出现在当前指令中。")
     for field in ("title", "scope", "target", "angle", "previous_angle", "question", "when"):
         value = getattr(action, field, "")
@@ -335,7 +354,9 @@ def target_event(c, action, state, created, question):
     ref = action.event_ref.strip()
     current = state["current_event"]
     candidates = registry(c)
-    explicit = named_refs(action.instruction) or named_refs(question)
+    explicit = named_refs(action.instruction)
+    if not explicit and not isinstance(action, CancelRun):
+        explicit = named_refs(question)
     if ref in REFERENCE:
         if len(explicit) > 1:
             raise ValueError("要操作哪个事件？请给出事件名称或编号。")
@@ -363,10 +384,6 @@ def target_event(c, action, state, created, question):
             names = "、".join(f'{e["title"]}（#{e["id"]}）' for e in matches[:5])
             raise ValueError("请指定其中一个事件，" + names if names else f"无法确定「{ref}」指向的事件，请给出名称或编号。")
         return matches[0]["id"]
-    if not ref and isinstance(action, CancelRun):
-        timer = one(c, "SELECT event_id FROM jobs WHERE id=? AND kind='scheduled_collect'", (action.job_id,))
-        if timer:
-            return timer["event_id"]
     if created and (not current or ref in ("", "刚建的事件", "刚才的事件")):
         return created
     if not current:

@@ -3,7 +3,7 @@ import hashlib
 import json
 import re
 
-from . import world_catalog as catalog, world_search as search_index
+from . import cards, world_catalog as catalog, world_search as search_index
 from .db import dump, one, require, rows
 from .world_catalog import CATEGORIES, normalize
 
@@ -226,6 +226,7 @@ def freeze_index(c, event, snap):
             "SELECT entry_id FROM world_link_choices WHERE event_id=? AND choice='exclude'", (event,)
         )
     }
+    excluded.update(row[0] for row in c.execute("SELECT entry_id FROM world_dispositions"))
     for ref in rows(
         c,
         """SELECT s.*,k.section FROM snapshot_claims s JOIN claims k ON k.id=s.claim_id
@@ -278,7 +279,10 @@ def browse(c, q="", category="", offset=0, limit=24, *, path=""):
         )
     counts = {
         r[0]: r[1]
-        for r in c.execute("SELECT category,count(*) FROM world_entries WHERE demo=0 GROUP BY category")
+        for r in c.execute(
+            """SELECT category,count(*) FROM world_entries w WHERE demo=0 AND NOT EXISTS
+                           (SELECT 1 FROM world_dispositions d WHERE d.entry_id=w.id) GROUP BY category"""
+        )
     }
     return {
         "entries": entries,
@@ -291,6 +295,9 @@ def browse(c, q="", category="", offset=0, limit=24, *, path=""):
 
 def detail(c, entry, revision=None):
     item = require(c, "world_entries", entry)
+    item["disposition"] = one(
+        c, "SELECT state,target,reason FROM world_dispositions WHERE entry_id=?", (entry,)
+    )
     ident = revision or item["head_id"]
     meta = version(c, ident)
     if not meta or meta["entry_id"] != entry:
@@ -336,11 +343,20 @@ def detail(c, entry, revision=None):
         related = rows(
             c,
             """SELECT w.id,k.subject,k.text FROM claims k JOIN world_entries w ON w.head_id=k.id
-                         WHERE k.entity_id=? AND w.demo=? AND w.id!=? ORDER BY w.id DESC LIMIT 24""",
+                         WHERE k.entity_id=? AND w.demo=? AND w.id!=? AND NOT EXISTS
+                         (SELECT 1 FROM world_dispositions d WHERE d.entry_id=w.id) ORDER BY w.id DESC LIMIT 24""",
             (entity["id"], item["demo"], entry),
         )
+    fields, card_evidence = cards.read(c, ident, json.loads(record["attributes"]))
     return {
         **item,
+        "card_evidence": card_evidence,
+        "disputes": rows(
+            c,
+            """SELECT d.*,r.reason resolution FROM world_disputes d JOIN world_versions v ON v.claim_id=d.version_id
+                           LEFT JOIN dispute_resolutions r ON r.dispute_id=d.id WHERE v.entry_id=? ORDER BY d.id""",
+            (entry,),
+        ),
         "version": meta["version"],
         "claim": claim,
         "history": history,
@@ -350,7 +366,17 @@ def detail(c, entry, revision=None):
         "breadcrumbs": catalog.breadcrumbs(record["path"]),
         "schema_id": record["schema_id"],
         "schema_version": record["schema_version"],
-        "attributes": json.loads(record["attributes"]),
+        "attributes": fields,
+        "field_evidence": [
+            ref
+            for ref in rows(
+                c,
+                "SELECT field,fragment_id,quote FROM field_evidence WHERE version_id=? ORDER BY field,fragment_id",
+                (ident,),
+            )
+            if ref["field"].removeprefix("attributes.") not in cards.CARD_FIELDS
+            or ref["field"].removeprefix("attributes.") in fields
+        ],
         "field_labels": catalog.SCHEMA_FIELDS[record["schema_id"]],
         "entity": entity,
         "related_entries": related,

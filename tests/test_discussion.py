@@ -141,6 +141,9 @@ def test_ownership_manual_fallback_and_legacy_matching(case):
     with store.connection(True) as c:
         other = db.add_event(c, "另一个独立事件", "另一事件的目标", [], status="paused")
         manual = forecast.revise(c, v["prediction_id"], 40, "人工依据", json.loads(v["refs"]), "人工")
+        dsh_revision = forecast.revise(
+            c, v["prediction_id"], 42, "较早的模型判断", json.loads(v["refs"]), "dashscope/kimi-k3.1-pro"
+        )
         original = db.one(c, "SELECT * FROM revision_runs WHERE revision_id=?", (v["id"],))
         c.execute("DELETE FROM revision_runs WHERE revision_id=?", (v["id"],))
         discussion.link_archived_runs(c)
@@ -161,6 +164,9 @@ def test_ownership_manual_fallback_and_legacy_matching(case):
     )
     assert api.get(f"/api/events/{other}/discussion/archive/{v['id']}").status_code == 404
     assert api.get(base + f"/archive/{manual}").json()["run"] is None
+    old_discussion = api.get(base, params={"revision": dsh_revision, "basis": "original"}).json()
+    assert old_discussion["anchor"]["model"] == "dashscope/kimi-k3.1-pro"
+    assert old_discussion["default_provider"] == "codex"
     assert api.get(base, params={"basis": "original"}).status_code == 422
     prompt = {
         "revision": manual,
@@ -170,7 +176,7 @@ def test_ownership_manual_fallback_and_legacy_matching(case):
     }
     assert api.post(f"/api/events/{other}/discussion", json=prompt).status_code == 404
     assert api.post(base, json=prompt).status_code == 202 and worker.step()
-    assert contexts[-1][0] == "discuss_dsh" and "forecast_run" not in contexts[-1][1]
+    assert contexts[-1][0] == "discuss_codex" and "forecast_run" not in contexts[-1][1]
     assert contexts[-1][1]["registered_forecast"]["reason"] == "人工依据"
     other_base = f"/api/events/{other}/discussion"
     assert (
@@ -225,7 +231,7 @@ def test_receipt_survives_worker_restart_before_answer(case):
         job = db.require(c, "jobs", result["job_id"])
         turn = discussion.job_turn(c, event, job["id"], result["turn_id"])
     ctx = json.loads(turn["context"])
-    _, _, run = worker.call_recorded(job, "discuss_dsh", ctx)
+    _, _, run = worker.call_recorded(job, "discuss_" + turn["provider"], ctx)
     recovered = Worker(store, worker.runner, acquisition=worker.acquisition)
     assert recovered.step()
     with store.connection() as c:

@@ -77,7 +77,7 @@ def test_event_command_immediate_round_recovery_and_each_subsequent_cycle(tmp_pa
         with store.connection() as c:
             j = db.require(c, "jobs", job_id)
             t = db.require(c, "discussion_turns", req.json()["turn_id"])
-        worker.call_recorded(j, "discuss_dsh", json.loads(t["context"]))
+        worker.call_recorded(j, "discuss_" + t["provider"], json.loads(t["context"]))
         worker = Worker(store, runner, acquisition=source)
         assert worker.step()
         assert calls == [msg["question"]]

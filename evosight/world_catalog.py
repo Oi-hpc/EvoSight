@@ -120,6 +120,9 @@ SCHEMA_FIELDS = {
     },
     "background": {"definition": "定义", "method": "方法", "scope": "适用范围", "source": "原始出处", "gap": "知识盲区"},
 }
+for _fields in SCHEMA_FIELDS.values():
+    _fields.update(publisher="发布方", source="原始出处", format="证据形式")
+
 NUMBER_FIELDS = {
     "value": "number",
     "independent_sources": "integer",

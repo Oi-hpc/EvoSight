@@ -61,6 +61,8 @@ class CandidateAction(BaseModel):
 
 
 class Limits(BaseModel):
+    agent_backend: Literal["codex", "dsh"] | None = None
+    news_agent_backend: Literal["codex", "dsh"] | None = None
     daily_calls: int = Field(ge=0, le=10000)
     monthly_calls: int = Field(ge=0, le=300000)
     verify_reserve: int = Field(ge=0, le=10000)
@@ -383,6 +385,7 @@ def make_app(store: Store, runner=None, *, background=True, acquisition=None):
     @app.get("/api/operations")
     def operations(job: int | None = None):
         with store.connection() as c:
+            limits = config(c)
             return {
                 "jobs": rows(
                     c,
@@ -397,10 +400,10 @@ def make_app(store: Store, runner=None, *, background=True, acquisition=None):
                     (job, job),
                 ),
                 "usage": usage(c),
-                "limits": config(c),
+                "limits": limits,
                 "concurrency": resources.capacity(c),
                 "mode": runner.mode,
-                "profiles": {role: runner.profile(role) for role in CONTRACTS},
+                "profiles": {role: worker.profile(role, limits) for role in CONTRACTS},
             }
 
     @app.post("/api/jobs/{ident}/retry")

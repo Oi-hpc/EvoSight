@@ -8,7 +8,11 @@ import secrets
 import sqlite3
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
+from contextvars import ContextVar
 from pathlib import Path
+
+
+job_lease = ContextVar("evosight_job_lease", default=None)
 
 
 def utc(value: datetime | None = None) -> str:
@@ -81,6 +85,8 @@ CREATE TABLE IF NOT EXISTS job_results(job_id INTEGER PRIMARY KEY REFERENCES job
 """
 
 DEFAULTS = {
+    "agent_backend": "codex",
+    "news_agent_backend": "dsh",
     "max_agent_concurrency": 2,
     "daily_calls": 1000,
     "monthly_calls": 30000,
@@ -109,6 +115,16 @@ class Store:
             from . import world
 
             world.prepare_schema(c)
+            session_columns = {r["name"] for r in c.execute("PRAGMA table_info(agent_sessions)")}
+            if "backend" not in session_columns:
+                c.execute("ALTER TABLE agent_sessions ADD COLUMN backend TEXT CHECK(backend IN ('codex','dsh'))")
+                c.execute(
+                    """UPDATE agent_sessions SET backend=CASE WHEN r.model LIKE 'dashscope/%' THEN 'dsh' ELSE 'codex' END
+                       FROM runs r WHERE r.id=COALESCE(agent_sessions.last_run,agent_sessions.busy_run)"""
+                )
+                c.execute("UPDATE agent_sessions SET backend='codex' WHERE backend IS NULL AND thread_id IS NOT NULL")
+            if "dsh_session_id" not in session_columns:
+                c.execute("ALTER TABLE agent_sessions ADD COLUMN dsh_session_id TEXT")
             if "grace_hours" not in {r["name"] for r in c.execute("PRAGMA table_info(predictions)")}:
                 c.execute("ALTER TABLE predictions ADD COLUMN grace_hours INTEGER NOT NULL DEFAULT 72")
             doc_columns = {r["name"] for r in c.execute("PRAGMA table_info(documents)")}
@@ -130,6 +146,9 @@ class Store:
 
             world.migrate(c)
             migrate_existing_knowledge(c)
+            from . import board
+
+            board.migrate(c)
             from .discussion import link_archived_runs
 
             link_archived_runs(c)
@@ -151,6 +170,16 @@ class Store:
         c.execute("PRAGMA foreign_keys=ON")
         try:
             c.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            lease = job_lease.get() if write else None
+            if (
+                lease
+                and lease[0] == self.path
+                and not c.execute(
+                    "SELECT 1 FROM jobs WHERE id=? AND owner=? AND status='running' AND lease>=?",
+                    (lease[1], lease[2], utc()),
+                ).fetchone()
+            ):
+                raise ValueError("任务租约已转移，旧执行者停止提交")
             yield c
             c.commit()
         except BaseException:

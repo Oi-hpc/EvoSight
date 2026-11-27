@@ -292,3 +292,94 @@ CREATE INDEX IF NOT EXISTS missing_source_windows ON round_sources(url,round_id)
 CREATE TABLE IF NOT EXISTS round_monitors (
     round_id INTEGER PRIMARY KEY REFERENCES tracking_rounds,added INTEGER NOT NULL,applied_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS event_guides (
+    id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL REFERENCES events, goal_version INTEGER NOT NULL,
+    question TEXT NOT NULL, reason TEXT NOT NULL, wake TEXT NOT NULL, query TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(event_id,goal_version,question,query)
+);
+CREATE TABLE IF NOT EXISTS guide_candidates (
+    guide_id INTEGER NOT NULL REFERENCES event_guides, version_id INTEGER NOT NULL REFERENCES claims,
+    found_at TEXT NOT NULL, PRIMARY KEY(guide_id,version_id)
+);
+CREATE TABLE IF NOT EXISTS guide_lines (
+    event_id INTEGER NOT NULL REFERENCES events,goal_version INTEGER NOT NULL,line TEXT NOT NULL,
+    guide_id INTEGER NOT NULL REFERENCES event_guides,PRIMARY KEY(event_id,goal_version,line)
+);
+CREATE TABLE IF NOT EXISTS event_notes (
+    id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL REFERENCES events, goal_version INTEGER NOT NULL,
+    round_id INTEGER REFERENCES tracking_rounds, task_id INTEGER REFERENCES research_tasks,
+    question TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL, kind TEXT NOT NULL,
+    reason TEXT NOT NULL, citations TEXT NOT NULL, recorded_at TEXT NOT NULL, note_key TEXT NOT NULL,
+    UNIQUE(event_id,note_key)
+);
+CREATE INDEX IF NOT EXISTS event_notes_by_goal ON event_notes(event_id,goal_version,id DESC);
+CREATE TABLE IF NOT EXISTS handoff_inbox (
+    note_id INTEGER PRIMARY KEY REFERENCES event_notes, documents TEXT NOT NULL, received_run INTEGER REFERENCES runs
+);
+CREATE TABLE IF NOT EXISTS world_dispositions (
+    entry_id INTEGER PRIMARY KEY REFERENCES world_entries, state TEXT NOT NULL CHECK(state IN ('event','withdrawn','merged')),
+    target INTEGER REFERENCES world_entries, reason TEXT NOT NULL, recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS world_disputes (
+    id INTEGER PRIMARY KEY, version_id INTEGER NOT NULL REFERENCES claims, event_id INTEGER NOT NULL REFERENCES events,
+    field TEXT NOT NULL, proposed TEXT NOT NULL, citations TEXT NOT NULL, reason TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open', UNIQUE(version_id,event_id,field,proposed,citations)
+);
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    lane TEXT PRIMARY KEY, thread_id TEXT, last_run INTEGER REFERENCES runs, checkpoint TEXT NOT NULL DEFAULT '{}',
+    busy_run INTEGER REFERENCES runs, backend TEXT CHECK(backend IN ('codex','dsh')), dsh_session_id TEXT
+);
+CREATE TABLE IF NOT EXISTS research_tool_steps (
+    task_id INTEGER NOT NULL REFERENCES research_tasks, step INTEGER NOT NULL, request TEXT NOT NULL, result TEXT NOT NULL,
+    PRIMARY KEY(task_id,step)
+);
+CREATE TABLE IF NOT EXISTS role_retries (
+    task_id INTEGER PRIMARY KEY REFERENCES research_tasks, attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS role_retry_sources (
+    task_id INTEGER NOT NULL REFERENCES research_tasks, job_id INTEGER NOT NULL REFERENCES jobs,
+    PRIMARY KEY(task_id,job_id)
+);
+CREATE TABLE IF NOT EXISTS forecast_reviews (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs, author_run INTEGER NOT NULL REFERENCES runs,
+    reviewer_run INTEGER NOT NULL REFERENCES runs, final_run INTEGER NOT NULL REFERENCES runs, decision TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS investigation_lines (
+    id INTEGER PRIMARY KEY,event_id INTEGER NOT NULL REFERENCES events,line_key TEXT NOT NULL,
+    goal_version INTEGER NOT NULL,question TEXT NOT NULL,role TEXT NOT NULL,last_task INTEGER REFERENCES research_tasks,
+    UNIQUE(event_id,line_key)
+);
+CREATE TABLE IF NOT EXISTS field_evidence (
+    version_id INTEGER NOT NULL REFERENCES claims,field TEXT NOT NULL,fragment_id INTEGER NOT NULL REFERENCES fragments,
+    quote TEXT NOT NULL,PRIMARY KEY(version_id,field,fragment_id)
+);
+CREATE TABLE IF NOT EXISTS dispute_resolutions (
+    dispute_id INTEGER PRIMARY KEY REFERENCES world_disputes,version_id INTEGER NOT NULL REFERENCES claims,
+    fragment_id INTEGER NOT NULL REFERENCES fragments,reason TEXT NOT NULL,recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS snapshot_checklist (
+    snapshot_id INTEGER NOT NULL REFERENCES knowledge_snapshots, position INTEGER NOT NULL,
+    question TEXT NOT NULL, rejection TEXT NOT NULL DEFAULT '', PRIMARY KEY(snapshot_id,position)
+);
+CREATE TABLE IF NOT EXISTS delivery_answers (
+    snapshot_id INTEGER NOT NULL, position INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('confirmed','unknown')),
+    answer TEXT NOT NULL,citations TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id,position), FOREIGN KEY(snapshot_id,position) REFERENCES snapshot_checklist
+);
+CREATE TABLE IF NOT EXISTS card_provenance (
+    version_id INTEGER PRIMARY KEY REFERENCES claims, fields TEXT NOT NULL, evidence TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS archive_publishers (
+    asset_id INTEGER PRIMARY KEY REFERENCES evidence_assets,name TEXT NOT NULL,locator TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS run_sessions (
+    run_id INTEGER PRIMARY KEY REFERENCES runs,lane TEXT,previous_run INTEGER,requested_thread TEXT,observed_thread TEXT
+);
+CREATE TABLE IF NOT EXISTS task_rejections (
+    task_id INTEGER NOT NULL REFERENCES research_tasks,subject TEXT NOT NULL,reason TEXT NOT NULL,
+    PRIMARY KEY(task_id,subject,reason)
+);
+CREATE TABLE IF NOT EXISTS snapshot_rejections (
+    snapshot_id INTEGER NOT NULL REFERENCES knowledge_snapshots,task_id INTEGER NOT NULL REFERENCES research_tasks,
+    subject TEXT NOT NULL,reason TEXT NOT NULL, PRIMARY KEY(snapshot_id,task_id,subject,reason)
+);

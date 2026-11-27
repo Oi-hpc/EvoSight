@@ -66,6 +66,8 @@ export interface Card {
   pinned_prediction: number | null
 }
 export interface Limits {
+  agent_backend: 'codex' | 'dsh'
+  news_agent_backend: 'codex' | 'dsh'
   max_agent_concurrency: number
   daily_calls: number
   monthly_calls: number

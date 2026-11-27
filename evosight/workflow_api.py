@@ -4,7 +4,8 @@ import json
 from fastapi import Query
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
-from . import focus, people, workflow, world, world_search, world_catalog as catalog
+from . import board, focus, people, workflow, world, world_search, world_catalog as catalog
+from .contracts import Guide
 from .db import enqueue, one, require, rows, utc
 from .feeds import public_url
 
@@ -63,6 +64,21 @@ class Unreference(BaseModel):
     reason: str = Field(min_length=2, max_length=400)
 
 
+class Disposition(BaseModel):
+    version_id: int = Field(ge=1)
+    state: Literal["withdrawn", "merged"]
+    target: int | None = Field(default=None, ge=1)
+    target_version: int | None = Field(default=None, ge=1)
+    reason: str = Field(min_length=2, max_length=400)
+    fragment_id: int = Field(ge=1)
+
+
+class DisputeDecision(BaseModel):
+    version_id: int = Field(ge=1)
+    fragment_id: int = Field(ge=1)
+    reason: str = Field(min_length=2, max_length=400)
+
+
 class VersionKey(BaseModel):
     entry_id: int = Field(ge=1)
     version_id: int | None = Field(default=None, ge=1)
@@ -77,6 +93,41 @@ class RecordRead(BaseModel):
 
 
 def register_workflow_api(app, store):
+    @app.post("/api/world/{entry}/disposition")
+    def disposition(entry: int, data: Disposition):
+        with store.connection(True) as c:
+            return board.set_disposition(
+                c,
+                entry,
+                data.version_id,
+                data.state,
+                data.target,
+                data.reason,
+                data.fragment_id,
+                data.target_version,
+            )
+
+    @app.post("/api/world/{entry}/disputes/{dispute}/resolve")
+    def resolve(entry: int, dispute: int, data: DisputeDecision):
+        with store.connection(True) as c:
+            return board.resolve_dispute(c, entry, dispute, data.version_id, data.fragment_id, data.reason)
+
+    @app.get("/api/events/{event}/board")
+    def event_board(event: int):
+        with store.connection() as c:
+            return board.view(c, event, workflow.current_goal(c, event)["version"])
+
+    @app.post("/api/events/{event}/guides")
+    def add_guide(event: int, guide: Guide, expected_goal: int):
+        with store.connection(True) as c:
+            goal = workflow.current_goal(c, event)
+            if expected_goal != goal["version"]:
+                raise workflow.VersionConflict("研究目标已经更新")
+            board.save_guides(
+                c, {"event_id": event, "goal_version": expected_goal}, {"guides": [guide.model_dump()]}
+            )
+            return board.view(c, event, expected_goal)["guides"]
+
     @app.get("/api/events/{event}/focus")
     def collection_scope(event: int):
         with store.connection() as c:
@@ -248,6 +299,10 @@ def register_workflow_api(app, store):
                 (event, rid),
             )
             if busy:
+                c.execute(
+                    """UPDATE jobs SET retry_at=NULL WHERE id=? AND kind='research_retry' AND status='queued'""",
+                    (busy["id"],),
+                )
                 return {"job": busy["id"]}
             if r["state"] in ("published", "unchanged"):
                 raise ValueError("该轮已经完成")

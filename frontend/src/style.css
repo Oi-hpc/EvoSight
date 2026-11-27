@@ -289,6 +289,33 @@ svg.lucide {
   margin: 0 auto;
   padding: 31px clamp(22px, 3vw, 50px) 50px;
 }
+.workspace:has(> .main > .discussion-pane) {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+}
+.main:has(> .discussion-pane) {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+  padding-block: clamp(10px, 2dvh, 22px) max(14px, env(safe-area-inset-bottom));
+}
+.main:has(> .discussion-pane) > .backlink {
+  align-self: flex-start;
+  margin-bottom: 6px;
+}
+.main:has(> .discussion-pane) > .page-head {
+  margin-bottom: 10px;
+}
+.main:has(> .discussion-pane) > .view-tabs {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  margin-bottom: 10px;
+}
+.main:has(> .discussion-pane) > .view-tabs .tab {
+  flex: none;
+}
 .page-head {
   display: flex;
   flex-wrap: wrap;

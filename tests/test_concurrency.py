@@ -58,9 +58,14 @@ def test_model_admission_shared_across_workers_and_idempotent(tmp_path, monkeypa
     store, source, runner, first = setup(tmp_path, ["news"])
     second = Worker(store, runner, acquisition=source)
     with store.connection(True) as c:
-        event = db.add_event(c, "并发样本", "费用计数和全局准入", [])
         jobs = [
-            db.require(c, "jobs", db.enqueue(c, "discussion", event=event, args={"turn_id": i}))
+            db.require(
+                c,
+                "jobs",
+                db.enqueue(
+                    c, "discussion", event=db.add_event(c, f"并发样本 {i}", "费用计数和全局准入", []), args={"turn_id": i}
+                ),
+            )
             for i in range(3)
         ]
         c.execute("UPDATE jobs SET status='running'")

@@ -49,6 +49,21 @@ type Goal = {
   related: number[]
 }
 type Knowledge = {
+  delivery_snapshot?: number | null
+  delivery?: {
+    position: number
+    question: string
+    state: 'confirmed' | 'unknown' | 'missing' | 'rejected'
+    answer: string
+    reason: string
+    citations: Pick<Cite, 'fragment_id' | 'document_id' | 'quote'>[]
+  }[]
+  rejections?: { task_id: number; subject: string; reason: string }[]
+  board?: {
+    guides: { id: number; question: string; reason: string; wake: string; query: { path?: string; query?: string; entity_id?: number; entry_id?: number }; candidates: { entry_id: number; version_id: number; subject: string }[] }[]
+    notes: { id: number; subject: string; body: string; reason: string; citations: { document_id: number; fragment_id: number; quote: string }[] }[]
+    lines?: { id: number; question: string; role: string; state: string; done_when: string; searches?: string[]; findings?: { subject: string; text: string }[] }[]
+  }
   goal: Goal
   event_status: string
   snapshot: number | null
@@ -86,6 +101,7 @@ type Knowledge = {
   closure: { id: number; reason: string } | null
 }
 type Task = {
+  rejections?: { subject: string; reason: string }[]
   id: number
   role_name: string
   question: string
@@ -319,6 +335,7 @@ async function research() {
 const documents = (id: number, fragment?: number) =>
   `#/events/${props.eventId}/doc/${id}` + (fragment ? '/' + fragment : '')
 const entries = computed(() => data.value?.sections[section.value] || [])
+const deliveryLabels = { confirmed: '已写入', unknown: '已写明证据缺口', missing: '漏写', rejected: '答复被拒' }
 </script>
 <template>
   <p v-if="error" class="error" role="alert">
@@ -381,6 +398,25 @@ const entries = computed(() => data.value?.sections[section.value] || [])
           <p v-if="section === 'background' && data.summary" class="kb-summary">
             {{ data.summary }}
           </p>
+          <section v-if="section === 'background' && data.delivery?.length" aria-label="交付核对">
+            <h3>交付核对</h3>
+            <p v-if="data.delivery_snapshot !== data.snapshot" class="meta">最近一次研究报告来自版本 #{{ data.delivery_snapshot }}。</p>
+            <article v-for="item in data.delivery" :key="item.position" class="rail-item">
+              <strong>{{ item.question }}</strong>
+              <small> · {{ deliveryLabels[item.state] }}</small>
+              <p v-if="item.answer || item.reason">{{ item.answer || item.reason }}</p>
+              <details v-if="item.citations.length">
+                <summary>查看原文依据（{{ item.citations.length }}）</summary>
+                <blockquote v-for="cite in item.citations" :key="cite.fragment_id + cite.quote">
+                  {{ cite.quote }} <a :href="documents(cite.document_id, cite.fragment_id)">查看片段 #{{ cite.fragment_id }}</a>
+                </blockquote>
+              </details>
+            </article>
+          </section>
+          <details v-if="section === 'background' && data.rejections?.length">
+            <summary>调查中曾被退回的提议（{{ data.rejections.length }}）</summary>
+            <p v-for="r in data.rejections" :key="r.task_id + r.subject + r.reason">调查 #{{ r.task_id }} · {{ r.subject }} · {{ r.reason }}</p>
+          </details>
           <p v-if="!entries.length" class="rail-item">
             {{ data.snapshot ? '这个索引章节暂无符合条件的条目。' : '等待建立事件知识索引。' }}
             <a :href="`#/events/${eventId}/research`">查看研究进度</a>
@@ -508,6 +544,32 @@ const entries = computed(() => data.value?.sections[section.value] || [])
             >
           </article>
         </section>
+        <section v-if="data.board?.guides.length" class="panel">
+          <header class="panel-head"><h2>世界知识查阅指南</h2></header>
+          <details v-for="g in data.board.guides" :key="g.id" class="rail-item">
+            <summary>{{ g.question }}</summary>
+            <p>{{ g.reason }} · {{ g.wake }}</p>
+            <p>{{ g.query.path }} {{ g.query.query }} {{ g.query.entry_id ? '条目 #' + g.query.entry_id : '' }}</p>
+            <p v-if="!g.candidates.length">等待匹配材料</p>
+            <p v-for="h in g.candidates" :key="h.version_id"><a :href="`#/world/${h.entry_id}/${h.version_id}/${eventId}`">候选 #{{ h.entry_id }} · {{ h.subject }}</a></p>
+          </details>
+        </section>
+        <section v-if="data.board?.lines?.length" class="panel">
+          <header class="panel-head"><h2>调查线</h2></header>
+          <details v-for="line in data.board.lines" :key="line.id" class="rail-item">
+            <summary>{{ line.question }} · {{ label(line.state) }}</summary>
+            <p>{{ label(line.role) }} · {{ line.done_when }}</p>
+            <p v-for="(query, i) in line.searches" :key="i">已查 {{ query }}</p>
+            <p v-for="(finding, i) in line.findings" :key="i"><strong>{{ finding.subject }}</strong> · {{ finding.text }}</p>
+          </details>
+        </section>
+        <section v-if="data.board?.notes.length" class="panel">
+          <header class="panel-head"><h2>事件专属材料</h2></header>
+          <details v-for="n in data.board.notes" :key="n.id" class="rail-item">
+            <summary>{{ n.subject }}</summary><p>{{ n.body }}</p><small>{{ n.reason }}</small>
+            <p v-for="(ref, i) in n.citations" :key="i"><a :href="documents(ref.document_id, ref.fragment_id)">材料 #{{ ref.document_id }}</a> · {{ ref.quote }}</p>
+          </details>
+        </section>
         <section v-if="data.gaps.length" class="panel">
           <header class="panel-head"><h2>尚待核实</h2></header>
           <p v-for="g in data.gaps" :key="g" class="rail-item">{{ g }}</p>
@@ -592,6 +654,10 @@ const entries = computed(() => data.value?.sections[section.value] || [])
                 {{ t.done_when }}</small
               >
               <p v-if="t.detail" class="meta">{{ t.detail }}</p>
+              <details v-if="t.rejections?.length">
+                <summary>本次调查曾退回的提议（{{ t.rejections.length }}）</summary>
+                <p v-for="row in t.rejections" :key="row.subject + row.reason">{{ row.subject }} · {{ row.reason }}</p>
+              </details>
               <button
                 v-if="
                   ['failed', 'deferred'].includes(t.state) && r.goal_version === data.goal.version

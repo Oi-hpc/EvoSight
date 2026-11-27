@@ -1,6 +1,14 @@
 """Structured planning and evidence proposals. The backend owns the final records."""
-from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from typing import Annotated, Literal
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PositiveInt,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from .world_catalog import PATHS, qualifier_terms
 
 Role = Literal[
@@ -44,6 +52,7 @@ class KnowledgeQuery(Record):
     query: str = Field(default="", max_length=200)
     path: str = Field(default="", max_length=100)
     entity_id: int | None = Field(default=None, ge=1)
+    entry_id: int | None = Field(default=None, ge=1)
     fields: list[str] = Field(default_factory=list, max_length=8)
     qualifiers: dict[str, str | int | float] = Field(default_factory=dict, max_length=4)
 
@@ -60,6 +69,13 @@ class KnowledgeQuery(Record):
         return self
 
 
+class Guide(Record):
+    question: str = Field(min_length=2, max_length=600)
+    reason: str = Field(min_length=2, max_length=400)
+    wake: str = Field(min_length=2, max_length=400)
+    lookup: KnowledgeQuery
+
+
 class Assignment(Record):
     role: Role
     question: str = Field(min_length=1, max_length=600)
@@ -69,6 +85,7 @@ class Assignment(Record):
     priority: int = Field(ge=1, le=5)
     search_query: str = Field(default="", max_length=250)
     knowledge_query: KnowledgeQuery | None = None
+    line: str = Field(default="", max_length=120)
 
 
 class Monitor(Record):
@@ -86,7 +103,7 @@ class KnowledgeLink(Record):
 
 class Citation(Record):
     fragment_id: int
-    quote: str = Field(min_length=2, max_length=800)
+    quote: str = Field(min_length=2)
 
 
 class PersonLead(Record):
@@ -108,6 +125,41 @@ class Plan(Record):
     use_knowledge: list[KnowledgeLink] = Field(default_factory=list, max_length=8)
     release_knowledge: list[KnowledgeLink] = Field(default_factory=list, max_length=8)
     person_leads: list[PersonLead] = Field(default_factory=list, max_length=4)
+    guides: list[Guide] = Field(default_factory=list, max_length=8)
+    retire_guides: list[int] = Field(default_factory=list, max_length=8)
+    checklist: list[Annotated[str, Field(min_length=2, max_length=400)]] = Field(
+        default_factory=list, max_length=16
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def keep_research_when_optional_lookup_is_invalid(cls, proposal):
+        if not isinstance(proposal, dict):
+            return proposal
+        proposal = dict(proposal)
+        gaps = list(proposal.get("postponed") or [])
+        if isinstance(proposal.get("guides"), list):
+            kept = []
+            for guide in proposal["guides"]:
+                try:
+                    kept.append(Guide.model_validate(guide))
+                except ValidationError:
+                    if len(gaps) < 10:
+                        gaps.append("一项指南的目录或字段不适用，暂缓该查阅规则")
+            proposal["guides"] = kept
+        if isinstance(proposal.get("tasks"), list):
+            tasks = []
+            for task in proposal["tasks"]:
+                if isinstance(task, dict) and task.get("knowledge_query") is not None:
+                    try:
+                        KnowledgeQuery.model_validate(task["knowledge_query"])
+                    except ValidationError:
+                        if len(gaps) < 10:
+                            gaps.append(f"{str(task.get('question',''))[:100]}的世界知识查询未通过校验，保留原始材料调查")
+                        task = {**task, "knowledge_query": None}
+                tasks.append(task)
+            proposal["tasks"] = tasks
+        return {**proposal, "postponed": gaps}
 
 
 class Finding(Record):
@@ -140,6 +192,25 @@ class Finding(Record):
     facets: dict[str, str | int] = Field(default_factory=dict, max_length=12)
     directory: str = Field(default="", max_length=100)
     attributes: dict[str, str | int | float] = Field(default_factory=dict, max_length=12)
+    scope: Literal["auto", "world", "event"] = "auto"
+    field_citations: dict[str, Citation] = Field(default_factory=dict, max_length=12)
+
+    @field_validator("field_citations", mode="before")
+    @classmethod
+    def normalize_field_evidence(cls, value):
+        if isinstance(value, list):
+            fields = {}
+            for item in value:
+                if not isinstance(item, dict) or not isinstance(item.get("field"), str):
+                    raise ValueError("字段依据需要字段名和引文")
+                name = item["field"]
+                if name in fields:
+                    raise ValueError("同一字段有多个无法区分的引文")
+                fields[name] = {k: v for k, v in item.items() if k != "field"}
+            value = fields
+        if isinstance(value, dict):
+            return {k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in value.items()}
+        return value
 
     @model_validator(mode="after")
     def assertion_or_reference(self):
@@ -180,15 +251,47 @@ class Followup(Record):
     due_at: str = ""
 
 
+class ResearchLookup(Record):
+    tool: Literal["archive", "read", "web", "world", "handoff"]
+    query: str = Field(min_length=2, max_length=2048)
+    recipient: str = Field(default="", max_length=120)
+    document_ids: list[PositiveInt] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def limit_search_text(self):
+        if len(self.query) > 250 and not (self.tool == "web" and self.query.startswith("https://")):
+            raise ValueError("检索词或交接内容最多 250 字，公开原文链接可至 2048 字")
+        return self
+
+
+class PublicationChoice(Record):
+    task_id: int = Field(ge=1)
+    finding: int = Field(ge=1, le=8)
+    scope: Literal["world", "event"]
+    reason: str = Field(min_length=2, max_length=400)
+
+
+class DeliveryAnswer(Record):
+    check_id: PositiveInt
+    state: Literal["confirmed", "unknown"]
+    answer: str = Field(min_length=2, max_length=1500)
+    citations: list[Citation] = Field(default_factory=list, max_length=6)
+
+
 class Report(Record):
     findings: list[Finding] = Field(default_factory=list, max_length=8)
     use_knowledge: list[KnowledgeLink] = Field(default_factory=list, max_length=4)
     gaps: list[str] = Field(default_factory=list, max_length=8)
     followups: list[Followup] = Field(default_factory=list, max_length=5)
     answered: list[int] = Field(default_factory=list, max_length=6)
+    lookup: ResearchLookup | None = None
 
 
 PLANNER = (
+    "checklist 按用户原始研究目标列出逐项可独立验收的问题，一项只核查一件事。"
+    "即使已有结论，也保留仍属本轮范围的核查点。取证任务的数量不限制交付清单的项数。"
+    "你负责事件规划。优先只安排一条能回答开放问题的调查线，存在独立问题才并行。line 复用黑板上同一调查线的名称。"
+    "guides 按问题保存值得长期查阅的世界知识目的地。每项写 question、reason、wake、lookup。目录为空也可保留，旧指南失效时填 retire_guides 的 ID。"
     "collection_scope 为用户在本事件中指定的每轮收集范围。优先辨认其中的具名人物、核对本轮材料与关注点，尚无直接材料时记录核查缺口。"
     "根据事件主题，在 person_leads 提出有材料明确点名的核心人物、参与者、发言人、专家或意见领袖。"
     "person_leads.role 使用中文枚举，tasks.role 使用英文枚举；每项任务须给 question、target、time_scope、done_when、priority，不适用的可选字段可省略。"
@@ -214,6 +317,16 @@ ROLE_INSTRUCTIONS["people"] += (
     "变化、可能影响及未知之处。心理或动机解释列为假设，须给替代解释和反证条件。"
 )
 RESEARCH = (
+    "资料卡的发布方由系统读取归档元数据。其他字段由你提议，逐项给 field_citations。"
+    "source 可填引用片段所附原始 URL，format 填档案实际形态（例如网页正文、订阅摘要），"
+    "stage 尽可能逐字摘取能说明实际阶段的短语。无法定位的值留空。"
+    "缺证且还有工具预算时，可在 lookup 请求 archive、read、world、web 或 handoff，query 写检索词、目的或交接内容。"
+    "web 的 query 也可填已经找到的公开 HTTPS 原文 URL，后台回访并返回归档编号。"
+    "read 用 document_ids 重读本事件归档的原文。handoff 的 recipient 填黑板已有的 line_key 或主 Agent，"
+    "可附至多四个已查的 document_ids。读到工具回执再决定下一步，结束时 lookup=null。"
+    "本轮缺口、排除项和预测依赖标 scope=event。能独立引用且原文支持的陈述标 scope=world。"
+    "field_citations 的键可用 text、subject、occurred_at、attributes.属性名或 facets.字段名。"
+    "每条字段引文须取自同一 fragment_id 的 citations 原句，可仅摘录支持字段的短语。核实对象、统计期和数值属于同一陈述。"
     "world_records 是本任务按固定版本读取的结构化记录。要把合适记录加入事件索引，可在 use_knowledge 填其 entry_id、version_id、章节和理由。"
     "record_schemas 定义各类型可填的英文字段。可在 attributes 保存引文支持的值、单位、统计期等，未提供的字段省略。directory 仅填所示且与 category 相符的目录路径。"
     "指标的 attributes.value 只登记引文中可逐项核对的原始读数。自行计算的涨跌幅、差额和倍数另写为分析，列出原数、引文和公式。"
@@ -221,7 +334,8 @@ RESEARCH = (
     "输出中文研究结果。每项结论的 citations 必须逐字复制输入 fragments 中对应 id 的原文短句，不可翻译引文。"
     "occurred_at 只有原文能支持实际发生时间才填，精确时刻含时区，只有日期填 YYYY-MM-DD，同时逐字摘录 time_quote。"
     "来源更新时间和获得时间不是发生时间。identity 仅填可区分同名者的公开身份。"
-    "replaces 只指向输入快照内被明确更正的声明 ID。证据不足写入 gaps。answered 只填本题已用新依据回答的待办 ID。"
+    "replaces 只指向输入快照内被明确更正的声明 ID。证据不足写入 gaps。"
+    "answered 只填输入 observations 中已用新依据回答的观察项 ID。observations 为空时填 []。"
     "新增条目会进入共享世界知识库。给出明确主体、资料的适用范围和对应类别。来自其他事件的历史事实沿用原日期。"
     "若可从已展示的原文补齐已有条目的缺失字段，或独立原文能印证原结论，可在 supports 填 prior 的 id 或 world_records 的 version_id。"
     "补证时省略 subject 和 text，由系统从该版本继承；只给 supports、已核实的新属性、逐字引文及协议要求的 section、kind。"

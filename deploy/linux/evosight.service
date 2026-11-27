@@ -1,0 +1,28 @@
+[Unit]
+Description=EvoSight workbench and worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=evosight
+Group=evosight
+WorkingDirectory=/opt/evosight/current
+Environment=HOME=/var/lib/evosight
+Environment=CODEX_HOME=/var/lib/evosight/codex
+Environment=EVOSIGHT_DSH_PATCH=/etc/evosight/dsh.yml
+Environment=PATH=/opt/evosight/runtime/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/evosight/agents.env
+ExecStart=/opt/evosight/current/.venv/bin/python -m evosight serve --data /var/lib/evosight/data --mode live --port 8765
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=40s
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/evosight
+
+[Install]
+WantedBy=multi-user.target

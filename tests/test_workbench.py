@@ -363,7 +363,8 @@ def test_safe_public_feed_parsing_and_profiles():
             feeds.public_url(u)
     assert Runner("test").profile("forecast") == ("gpt-6.2-sol", "low")
     assert Runner().profile("forecast") == ("gpt-6.2-astra", "max")
-    assert Runner().profile("study") == ("dashscope/kimi-k3.1-pro", "max")
+    assert Runner().profile("study") == ("gpt-6.2-astra", "max")
+    assert Runner().profile("discuss_dsh") == ("dashscope/kimi-k3.1-pro", "max")
 
 
 def test_http_entry_points_local_origin_and_fixed_sample(store):

@@ -1,22 +1,40 @@
 """Execute recoverable research rounds and publish their evidence, knowledge, and follow-up work."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextvars import copy_context
 from datetime import datetime, timedelta
 import json
 from itertools import zip_longest
 import re
 
-from . import feeds, focus, materials, people, resources, watch, workflow, world, world_catalog, world_search
+from . import (
+    board,
+    cards,
+    delivery,
+    feeds,
+    focus,
+    grounding,
+    materials,
+    people,
+    resources,
+    watch,
+    workflow,
+    world,
+    world_catalog,
+    world_search,
+)
 from .agents import Analysis
-from .contracts import Assignment, Report, ROLE_NAMES, FACETS
+from .contracts import Assignment, Plan, Report, ROLE_NAMES, FACETS
 from .db import DispatchDeferred, config, dump, enqueue, instant, later, node, one, require, rows, usage, utc
 
 
 def model_fragments(fragments):
+    source_times = ("published_at", "source_updated_at")
     return [
         {
-            k: (v[:1350] if k == "text" else v.split("#:~:text=", 1)[0] if k == "link" else v)
+            k: (v[:2400] if k == "text" else v.split("#:~:text=", 1)[0] if k == "link" else v)
             for k, v in f.items()
             if k in ("id", "document_id", "text", "locator", "kind", "title", "link")
+            or (k in source_times and v and f.get("source_times_checked"))
         }
         for f in fragments[:22]
     ]
@@ -80,8 +98,9 @@ def supported_time(proposed, quote):
     return dates[0][0] if len(dates) == 1 and dates[0][0] == proposed[:10] else ""
 
 
-def check_report(report, fragments, context, role):
-    visible = {f["id"]: f for f in model_fragments(fragments)}
+def check_report(report, fragments, context, role, *, rejections=None):
+    exposed = set(context.get("archive_fragment_ids", []))
+    visible = {f["id"]: f for i, f in enumerate(fragments) if i < 22 or f["id"] in exposed}
     old_ids = {i["id"] for i in context.get("prior", [])}
     known = {i["id"]: i for i in context.get("prior", [])}
     known.update(
@@ -124,13 +143,78 @@ def check_report(report, fragments, context, role):
                 or category
             )
         world_catalog.directory_for(category, finding.subject, finding.text, finding.directory)
-        world_catalog.attributes(category, finding.facets, finding.attributes)
-        for citation in finding.citations:
+        labels = world_catalog.SCHEMA_FIELDS[category]
+        aliases = {label: key for key, label in labels.items()}
+        unregistered = set()
+        for key in list(finding.attributes):
+            if key in labels:
+                continue
+            value = finding.attributes.pop(key)
+            if key in aliases:
+                canonical = aliases[key]
+                if canonical in finding.attributes and finding.attributes[canonical] != value:
+                    raise ValueError("同一结构化字段给出了不同值")
+                finding.attributes[canonical] = value
+            else:
+                unregistered.add(key)
+                if rejections is not None:
+                    rejections.append((f"{finding.subject} · {key}", f"{category} 未注册此属性，保留有引文的正文"))
+        for key in cards.CARD_FIELDS.intersection(finding.attributes):
+            value = finding.attributes[key]
             if (
-                citation.fragment_id not in visible
-                or citation.quote.strip() not in visible[citation.fragment_id]["text"]
+                key not in world_catalog.SCHEMA_FIELDS[category]
+                or not isinstance(value, str)
+                or not 1 <= len(value.strip()) <= 500
             ):
-                raise ValueError("角色引文与本次输入片段不相符，需重试")
+                finding.attributes.pop(key)
+                if rejections is not None:
+                    rejections.append((f"{finding.subject} · {key}", "资料卡字段不适用于当前类型或缺少有据的短文本"))
+        world_catalog.attributes(category, finding.facets, finding.attributes)
+        finding.citations = [grounding.locate(ref, visible) for ref in finding.citations]
+        if unregistered and category == "indicators" and not finding.attributes and not re.search(r"\d", finding.text):
+            raise ValueError(f"未注册属性 {', '.join(sorted(unregistered))}，指标正文也缺少可核对的原始读数")
+        if (
+            unregistered
+            and finding.kind in ("fact", "reported", "correction")
+            and not delivery.supported_quantities(finding.text, [ref.quote for ref in finding.citations])
+        ):
+            raise ValueError("正文中的数值无法用所引原文核实")
+        # Field-level wording may be elsewhere in the same archived paragraph.
+        fields = {}
+        for field, citation in finding.field_citations.items():
+            short = grounding.field_path(field).split(".")[-1]
+            if short in unregistered:
+                continue
+            optional = next((k for k in cards.CARD_FIELDS if short in (k, labels.get(k))), None)
+            try:
+                key = grounding.field_name(field, finding, labels)
+                citation = grounding.locate(citation, visible)
+                if not any(parent.fragment_id == citation.fragment_id for parent in finding.citations):
+                    source = visible[citation.fragment_id]
+                    if (
+                        key == "attributes.source"
+                        and finding.attributes.get("source") == source.get("url")
+                        and any(
+                            visible[parent.fragment_id].get("document_id") == source.get("document_id")
+                            for parent in finding.citations
+                        )
+                    ):
+                        # A title in the same archived article can identify the source URL.
+                        # The card writer will record the URL on its primary cited document.
+                        continue
+                    raise ValueError("字段依据不在本条引用的归档片段")
+            except ValueError:
+                if optional:
+                    finding.attributes.pop(optional, None)
+                    finding.facets.pop(labels.get(optional), None)
+                    if rejections is not None:
+                        rejections.append(
+                            (f"{finding.subject} · {labels.get(optional,optional)}", "资料卡字段依据无法在本条引文中定位")
+                        )
+                    continue
+                raise ValueError("字段引文须能在本条所引同一片段的归档原文中定位") from None
+            fields[key] = citation
+        finding.field_citations = fields
         if finding.replaces and finding.replaces not in old_ids:
             raise ValueError("不能订正输入快照以外的声明")
         if finding.supports:
@@ -153,9 +237,30 @@ def check_report(report, fragments, context, role):
             numbers = re.findall(r"(?<![\d.])[-+]?\d+(?:\.\d+)?(?![\d.])", quotes)
             if not any(float(n) == finding.attributes["value"] for n in numbers):
                 raise ValueError("指标数值需要对应引文中的原始数字，换算前先保留原口径")
+            models = re.findall(
+                r"(?i)\b[a-z]{1,8}\d+[a-z\d]*\b",
+                " ".join((finding.subject, str(finding.attributes.get("measure", "")))),
+                re.ASCII,
+            )
+            supported = " ".join(
+                x.quote + " " + visible[x.fragment_id].get("title", "")
+                for x in finding.citations
+                if any(
+                    float(n) == finding.attributes["value"]
+                    for n in re.findall(r"(?<![\d.])[-+]?\d+(?:\.\d+)?(?![\d.])", x.quote.replace(",", ""))
+                )
+            )
+            if models and not any(
+                re.search(r"(?<![a-z0-9])" + re.escape(m) + r"(?![a-z0-9])", supported, re.I | re.ASCII)
+                for m in models
+            ):
+                raise ValueError("指标数值的来源未对应所声明的对象或型号")
 
-    if not set(report.answered) <= observation_ids:
-        raise ValueError("角色回答了不属于本轮的观察项")
+    unfamiliar = sorted(set(report.answered) - observation_ids)
+    if unfamiliar:
+        report.answered = [ident for ident in report.answered if ident in observation_ids]
+        if rejections is not None:
+            rejections.append(("观察项", "已忽略不属于本轮的观察项 ID " + "、".join(map(str, unfamiliar))))
     accepted, rejected = [], []
     for finding in report.findings:
         try:
@@ -166,6 +271,8 @@ def check_report(report, fragments, context, role):
         else:
             accepted.append(finding)
     if rejected:
+        if rejections is not None:
+            rejections.extend(rejected)
         if not accepted:
             raise ValueError(rejected[0][1])
         report.findings = accepted
@@ -184,12 +291,12 @@ def conflicting_support(c, finding):
         return ""
     stored = one(
         c,
-        """SELECT d.attributes FROM world_versions v JOIN world_entries w ON w.id=v.entry_id
+        """SELECT w.head_id,d.attributes FROM world_versions v JOIN world_entries w ON w.id=v.entry_id
         JOIN world_record_data d ON d.version_id=w.head_id WHERE v.claim_id=?""",
         (finding.supports,),
     )
-    old = json.loads(stored["attributes"]) if stored else {}
-    changed = [k for k, v in finding.attributes.items() if k in old and old[k] != v]
+    old = cards.read(c, stored["head_id"], json.loads(stored["attributes"]))[0] if stored else {}
+    changed = [k for k, v in finding.attributes.items() if k != "publisher" and k in old and old[k] != v]
     return f"版本 #{finding.supports} 的补证提议改变了已有字段 {'、'.join(changed)}，需另提有据订正" if changed else ""
 
 
@@ -206,7 +313,7 @@ def validated_task_report(c, task):
     return report
 
 
-def claim(c, event, role, item, fragments):
+def claim(c, event, role, item, fragments, *, task_id=None):
     demo = require(c, "events", event)["demo"]
     cites = []
     for ref in item.citations:
@@ -230,6 +337,8 @@ def claim(c, event, role, item, fragments):
     parent = world.version(c, predecessor) if predecessor else None
     if predecessor and not parent:
         raise ValueError("找不到被订正的世界知识版本")
+    if parent and one(c, "SELECT 1 FROM world_dispositions WHERE entry_id=?", (parent["entry_id"],)):
+        raise ValueError("该世界知识已归入事件、撤回或合并，请重新选择补证对象")
     if parent and parent["demo"] != demo:
         raise ValueError("演示资料与真实资料不能混用")
     if item.supports:
@@ -240,8 +349,11 @@ def claim(c, event, role, item, fragments):
         known_quotes = {(c["document_id"], c["fragment_id"], c["quote"]) for c in prior_cites}
         new_cites = [v for v in cites if (v["document_id"], v["fragment_id"], v["quote"]) not in known_quotes]
         prior_record = one(c, "SELECT attributes FROM world_record_data WHERE version_id=?", (head["id"],))
-        inherited = json.loads(prior_record["attributes"])
-        if any(key in inherited and inherited[key] != value for key, value in item.attributes.items()):
+        inherited, _ = cards.read(c, head["id"], json.loads(prior_record["attributes"]))
+        if any(
+            key != "publisher" and key in inherited and inherited[key] != value
+            for key, value in item.attributes.items()
+        ):
             raise ValueError("补证沿用原字段值，字段值改变时应提交有据订正")
         if not new_cites and not (item.attributes.keys() - inherited.keys()):
             return head["id"], False
@@ -269,6 +381,29 @@ def claim(c, event, role, item, fragments):
     if item.supports:
         attributes = {**inherited, **attributes}
     fields = world_catalog.attributes(category, item.facets, attributes)
+    verified, _ = cards.verify(
+        c, cites, fields, [{"field": k, **v.model_dump()} for k, v in item.field_citations.items()]
+    )
+    if task_id is not None:
+        c.executemany(
+            "INSERT OR IGNORE INTO task_rejections VALUES(?,?,?)",
+            [
+                (
+                    task_id,
+                    f"{item.subject} · {world_catalog.SCHEMA_FIELDS[category].get(key,key)}",
+                    "资料卡提议与归档依据不符",
+                )
+                for key in cards.CARD_FIELDS.intersection(fields)
+                if fields[key] != verified.get(key)
+            ],
+        )
+    fields = {**{k: v for k, v in fields.items() if k not in cards.CARD_FIELDS}, **verified}
+    for key in cards.CARD_FIELDS:
+        label = world_catalog.SCHEMA_FIELDS[category].get(key)
+        if label in item.facets:
+            item.facets.pop(label)
+        if key not in verified:
+            item.field_citations.pop("attributes." + key, None)
     derived = world_catalog.attributes(category, item.facets)
     identity = world.signature(
         event,
@@ -280,7 +415,7 @@ def claim(c, event, role, item, fragments):
         cites,
         item.facets,
         parent["canonical_id"] if parent else None,
-        {k: v for k, v in fields.items() if k not in derived or derived[k] != v},
+        {k: v for k, v in fields.items() if k != "publisher" and (k not in derived or derived[k] != v)},
     )
     existing = world.matching(c, demo, identity)
     if existing:
@@ -319,6 +454,18 @@ def claim(c, event, role, item, fragments):
     ).lastrowid
     c.execute("INSERT INTO claim_details VALUES(?,?,?)", (ident, dump(item.facets), dump(item.aliases)))
     world.register(c, ident, category=category, key=identity, path=item.directory, attributes=fields)
+    if item.supports:
+        c.execute(
+            """INSERT OR IGNORE INTO field_evidence SELECT ?,field,fragment_id,quote
+                     FROM field_evidence WHERE version_id=?""",
+            (ident, predecessor),
+        )
+    c.executemany(
+        "INSERT OR IGNORE INTO field_evidence VALUES(?,?,?,?)",
+        [(ident, key, ref.fragment_id, ref.quote) for key, ref in item.field_citations.items()],
+    )
+    cards.refresh(c, ident)
+    world_search.index_head(c, world.version(c, ident)["entry_id"])
     return ident, True
 
 
@@ -326,6 +473,8 @@ def study_context(c, r):
     event = r["event_id"]
     e = require(c, "events", event)
     prior = workflow.snapshot_claims(c, r["parent_snapshot"]) if r["parent_snapshot"] else []
+    hidden = {row[0] for row in c.execute("SELECT entry_id FROM world_dispositions")}
+    prior = [k for k in prior if k["world_id"] not in hidden]
     goal = workflow.current_goal(c, event)
     objects = rows(
         c, "SELECT id,title,scope FROM events WHERE id!=? AND (demo=0 OR ?=1) LIMIT 36", (event, e["demo"])
@@ -336,7 +485,14 @@ def study_context(c, r):
     paths.update(p for route in routes for p in world_catalog.prefixes(route["path"]))
     return {
         "事件": e["title"],
+        "事件黑板": board.view(c, event, goal["version"]),
+        "此前判断": rows(
+            c,
+            "SELECT title,body,refs FROM nodes WHERE event_id=? AND kind='judgment' ORDER BY id DESC LIMIT 3",
+            (event,),
+        ),
         "研究范围": e["scope"],
+        "此前交付清单": delivery.view(c, r["parent_snapshot"]) if r["parent_snapshot"] else [],
         "priority": goal["priority"],
         "goal_version": r["goal_version"],
         "window": [r["window_start"], r["window_end"]],
@@ -495,7 +651,7 @@ def acquire(worker, r, job):
     person_seeds = people.seed(worker, r)
 
     def scout(ctx):
-        return worker.call(job, "source_scout", ctx)[0]
+        return worker.call(job, "source_scout", {**ctx, "window": [r["window_start"], r["window_end"]]})[0]
 
     seeds = watch.choose(
         worker.store,
@@ -636,12 +792,13 @@ def task_knowledge(c, r, task, assignment, plan):
     demo = require(c, "events", r["event_id"])["demo"]
     query = assignment.get("knowledge_query") or {}
     keys = []
-    if query.get("query") or query.get("path") or query.get("entity_id"):
+    if query.get("query") or query.get("path") or query.get("entity_id") or query.get("entry_id"):
         hits, _ = world_search.search(
             c,
             query.get("query", ""),
             path=query.get("path", ""),
             entity_id=query.get("entity_id"),
+            entry_id=query.get("entry_id"),
             qualifiers=query.get("qualifiers"),
             event=r["event_id"],
             demo=demo,
@@ -683,6 +840,8 @@ def prepare_task(worker, r, t, assignment, context, ids):
         except Exception:
             found = []
         for entry, res, ex in found:
+            if ex.published_at and ex.published_at > r["window_end"]:
+                continue
             if t["role"] == "people":
                 from urllib.parse import urlsplit
                 from .person_sources import HOSTS
@@ -709,6 +868,7 @@ def prepare_task(worker, r, t, assignment, context, ids):
 
 
 def save_plan(c, r, plan):
+    board.save_guides(c, r, plan.model_dump())
     c.execute(
         "UPDATE tracking_rounds SET plan=?,state='researching' WHERE id=?", (dump(plan.model_dump()), r["id"])
     )
@@ -732,6 +892,24 @@ def save_plan(c, r, plan):
                 task.priority,
             ),
         )
+        tid = one(
+            c,
+            "SELECT id FROM research_tasks WHERE round_id=? AND role=? AND question=?",
+            (r["id"], task.role, task.question),
+        )["id"]
+        c.execute(
+            """INSERT INTO investigation_lines(event_id,line_key,goal_version,question,role,last_task) VALUES(?,?,?,?,?,?)
+                  ON CONFLICT(event_id,line_key) DO UPDATE SET goal_version=excluded.goal_version,question=excluded.question,
+                  role=excluded.role,last_task=excluded.last_task""",
+            (
+                r["event_id"],
+                task.line or f"{task.role}/{task.target or task.question}",
+                r["goal_version"],
+                task.question,
+                task.role,
+                tid,
+            ),
+        )
 
 
 def validated_links(proposals, available):
@@ -742,6 +920,78 @@ def validated_links(proposals, available):
             accepted.append(link)
             available.remove(key)
     return accepted
+
+
+def role_lookup(worker, r, task, request):
+    event, query = r["event_id"], request.query
+    if request.tool == "web":
+        docs = []
+        for entry, response, extracted in worker.acquisition.targeted(query)[:4]:
+            if extracted.published_at and extracted.published_at > r["window_end"]:
+                continue
+            with worker.store.connection(True) as c:
+                docs.append(
+                    materials.attach_search_result(c, event, entry, response, extracted, intake="backfill")
+                )
+        return {"documents": docs}
+    with worker.store.connection(True) as c:
+        if request.tool == "archive":
+            return {"documents": board.archive_search(c, event, query, r["window_end"])}
+        if request.tool == "world":
+            hits, _ = world_search.search(
+                c, query, event=event, demo=require(c, "events", event)["demo"], limit=3
+            )
+            records = world_search.read_records(
+                c, hits, evidence=True, demo=require(c, "events", event)["demo"]
+            )
+            return {
+                "world_records": records,
+                "documents": list(dict.fromkeys(d for rec in records for d in rec.get("refs", []))),
+            }
+        permitted = [
+            d
+            for d in dict.fromkeys(request.document_ids)
+            if one(
+                c,
+                """SELECT 1 FROM event_docs ed
+                     JOIN documents d ON d.id=ed.document_id WHERE ed.event_id=? AND d.id=?
+                     AND ed.intake NOT IN ('future','person_candidate') AND (d.published_at IS NULL OR d.published_at<=?)
+                     AND (d.observed_at<=? OR d.id IN (SELECT value FROM json_each(?)) OR EXISTS (
+                         SELECT 1 FROM research_tasks t,json_each(t.input_ids) j WHERE t.round_id=? AND j.value=d.id))""",
+                (event, d, r["window_end"], r["window_end"], r["input_docs"] or "[]", r["id"]),
+            )
+        ]
+        if request.tool == "read":
+            return {"documents": permitted}
+        recipient = request.recipient or "主 Agent"
+        if recipient != "主 Agent":
+            matches = rows(
+                c,
+                """SELECT line_key FROM investigation_lines WHERE event_id=? AND goal_version=?
+                               AND (line_key=? OR role=?)""",
+                (event, r["goal_version"], recipient, recipient),
+            )
+            if len(matches) != 1:
+                return {"error": "请从黑板选择一条现有调查线，或交给主 Agent"}
+            recipient = matches[0]["line_key"]
+        ident = board.note(
+            c,
+            event,
+            r["goal_version"],
+            task["question"],
+            recipient,
+            query,
+            "handoff",
+            "侦查员交接",
+            [],
+            rid=r["id"],
+            task=task["id"],
+            documents=permitted,
+        )
+        c.execute(
+            "INSERT OR IGNORE INTO handoff_inbox(note_id,documents) VALUES(?,?)", (ident, dump(permitted))
+        )
+        return {"recipient": recipient, "message_id": ident, "documents": permitted}
 
 
 def run_role(worker, job, r, plan, ctx, ids, t):
@@ -761,21 +1011,71 @@ def run_role(worker, job, r, plan, ctx, ids, t):
             worker, r, t, assignment, role_context, list(dict.fromkeys([*ids, *historical_docs]))
         )
         with worker.store.connection() as c:
-            frags = materials.fragments_for(c, inputs)
+            frags = materials.fragments_for(c, inputs, per_document=None)
             if t["role"] == "people":
                 role_context["people_watch"] = people.public_context(c, r)
-        result, _ = worker.call(
-            job,
-            t["role"],
-            {
-                **role_context,
-                "task": {**assignment, "time_scope": t["time_scope"]},
-                **({"上次校验反馈": t["detail"] + "。请逐字复制本次输入中的引文；材料不足时留下知识缺口。"} if t["detail"] else {}),
-                "fragments": model_fragments(frags),
-            },
-        )
+        feedback = {"上次校验反馈": t["detail"] + "。请逐字复制输入引文，材料不足时留下缺口。"} if t["detail"] else {}
+        history = []
+        for step in range(3):
+            role_context["archive_fragment_ids"] = [f["id"] for f in frags]
+            with worker.store.connection() as c:
+                previous = one(
+                    c,
+                    "SELECT request,result FROM research_tool_steps WHERE task_id=? AND step=?",
+                    (t["id"], step),
+                )
+                role_context["事件黑板"] = board.view(c, r["event_id"], r["goal_version"])
+            if previous:
+                request, response = json.loads(previous["request"]), json.loads(previous["result"])
+            else:
+                result, _ = worker.call(
+                    job,
+                    t["role"],
+                    {
+                        **role_context,
+                        **feedback,
+                        "task": {**assignment, "time_scope": t["time_scope"]},
+                        "工具剩余次数": 2 - step,
+                        "工具回执": history,
+                        "fragments": model_fragments(frags),
+                    },
+                )
+                if step == 2 and result.lookup:
+                    pending = f"本轮工具额度已用完，留待下次查证“{result.lookup.query}”。"
+                    if len(result.gaps) < 8:
+                        result.gaps.append(pending)
+                    else:
+                        result.gaps[-1] += "。" + pending
+                if not result.lookup or step == 2:
+                    result.lookup = None
+                    break
+                request = result.lookup.model_dump()
+                response = role_lookup(worker, r, t, result.lookup)
+                with worker.store.connection(True) as c:
+                    c.execute(
+                        "INSERT OR IGNORE INTO research_tool_steps VALUES(?,?,?,?)",
+                        (t["id"], step, dump(request), dump(response)),
+                    )
+            history.append({"request": request, "result": response})
+            inputs = list(dict.fromkeys([*response.get("documents", []), *inputs]))
+            role_context["world_records"] = [
+                *role_context["world_records"],
+                *response.get("world_records", []),
+            ]
+            with worker.store.connection(True) as c:
+                c.execute("UPDATE research_tasks SET input_ids=? WHERE id=?", (dump(inputs), t["id"]))
+                frags = materials.fragments_for(c, inputs, per_document=None)
         submitted = len(result.findings)
-        check_report(result, frags, role_context, t["role"])
+        rejects = []
+        try:
+            check_report(result, frags, role_context, t["role"], rejections=rejects)
+        finally:
+            if rejects:
+                with worker.store.connection(True) as c:
+                    c.executemany(
+                        "INSERT OR IGNORE INTO task_rejections VALUES(?,?,?)",
+                        [(t["id"], subject, reason) for subject, reason in rejects],
+                    )
         count = len(result.findings)
         detail = f"{count} 项通过核查，{submitted-count} 项理由见知识缺口。" if count < submitted else ""
         with worker.store.connection(True) as c:
@@ -795,6 +1095,70 @@ def run_role(worker, job, r, plan, ctx, ids, t):
                 ("deferred" if budget_error else "failed", str(error)[:250], t["id"]),
             )
     return budget_error
+
+
+def run_guide(worker, job, args, candidates):
+    with worker.store.connection(True) as c:
+        event = job["event_id"]
+        g = require(c, "event_guides", args["guide_id"])
+        if (
+            g["event_id"] != event
+            or not g["active"]
+            or g["goal_version"] != workflow.current_goal(c, event)["version"]
+        ):
+            return "查阅指南已更新"
+        query = json.loads(g["query"])
+        if "version_id" in args:
+            vid = args["version_id"]
+            rec = world.version(c, vid)
+            if (
+                not rec
+                or rec["head_id"] != vid
+                or not board.guide_matches(c, event, query, entry=rec["entry_id"])
+            ):
+                return "候选已更新"
+            ids = json.loads(require(c, "claims", vid)["refs"])
+            query["entry_id"] = rec["entry_id"]
+        else:
+            ids = [args["document_id"]]
+        c.executemany(
+            "INSERT OR IGNORE INTO event_docs(event_id,document_id,intake) VALUES(?,?,'backfill')",
+            [(event, doc) for doc in ids],
+        )
+        key = f"guide/{event}/{g['goal_version']}/{args['dispatch_key']}"
+        r = one(c, "SELECT * FROM tracking_rounds WHERE request_key=?", (key,))
+        if not r:
+            last = workflow.latest(c, event)
+            now = utc()
+            rid = c.execute(
+                """INSERT INTO tracking_rounds(event_id,goal_version,request_key,reasons,window_start,window_end,
+                          created_at,parent_snapshot,input_docs,job_id) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    event,
+                    g["goal_version"],
+                    key,
+                    dump(["指南定向核查"]),
+                    now,
+                    now,
+                    now,
+                    last["id"] if last else None,
+                    dump(ids),
+                    job["id"],
+                ),
+            ).lastrowid
+            r = require(c, "tracking_rounds", rid)
+            task = Assignment(
+                role="specialist",
+                line=f"guide-{g['id']}",
+                question=g["question"],
+                target=g["reason"],
+                time_scope="history",
+                done_when=g["wake"],
+                priority=4,
+                knowledge_query=query,
+            )
+            save_plan(c, r, Plan(rationale=g["reason"], tasks=[task]))
+    return run_round(worker, job, r["id"], candidates)
 
 
 def run_round(worker, job, rid, candidates):
@@ -934,19 +1298,21 @@ def run_round(worker, job, rid, candidates):
         tasks = rows(c, "SELECT * FROM research_tasks WHERE round_id=? ORDER BY priority DESC,id", (rid,))
     pending = [task for task in tasks if task["state"] not in ("done", "failed")]
     budget_error = ""
-    while pending and not budget_error:
-        with worker.store.connection() as c:
-            width = resources.capacity(c)["effective"]
-        if not width:
-            raise resources.ResourcePressure("可用内存不足，已保存本轮进度")
-        wave, pending = pending[:width], pending[width:]
-        if len(wave) == 1:
-            budget_error = run_role(worker, job, r, plan, ctx, ids, wave[0])
-        else:
-            with ThreadPoolExecutor(max_workers=len(wave), thread_name_prefix="evosight-role") as pool:
-                futures = [pool.submit(run_role, worker, job, r, plan, ctx, ids, t) for t in wave]
-                results = [future.result() for future in futures]
-            budget_error = next((error for error in results if error), "")
+    with ThreadPoolExecutor(max_workers=resources.MAX_AGENTS, thread_name_prefix="evosight-role") as pool:
+        active = set()
+        while active or (pending and not budget_error):
+            with worker.store.connection() as c:
+                width = resources.capacity(c)["effective"]
+            if not width and not active:
+                raise resources.ResourcePressure("可用内存不足，已保存本轮进度")
+            while pending and not budget_error and len(active) < width:
+                active.add(
+                    pool.submit(copy_context().run, run_role, worker, job, r, plan, ctx, ids, pending.pop(0))
+                )
+            done, active = wait(active, return_when=FIRST_COMPLETED)
+            for future in done:
+                error = future.result()
+                budget_error = budget_error or error
     with worker.store.connection() as c:
         tasks = rows(c, "SELECT * FROM research_tasks WHERE round_id=? ORDER BY id", (rid,))
         if not workflow.goal_matches(c, r):
@@ -959,7 +1325,12 @@ def run_round(worker, job, rid, candidates):
         all_ids = list(dict.fromkeys([*ids, *[i for t in completed for i in json.loads(t["input_ids"])]]))
         docs = [require(c, "documents", i) for i in all_ids]
         reports = [
-            {"角色": t["role"], "问题": t["question"], **validated_task_report(c, t).model_dump()}
+            {
+                "task_id": t["id"],
+                "角色": t["role"],
+                "问题": t["question"],
+                **validated_task_report(c, t).model_dump(),
+            }
             for t in completed
         ]
         old_judgments = rows(
@@ -967,8 +1338,32 @@ def run_round(worker, job, rid, candidates):
             "SELECT title,body FROM nodes WHERE event_id=? AND kind='judgment' ORDER BY id DESC LIMIT 3",
             (r["event_id"],),
         )
+        past_docs = [row["id"] for row in ctx.get("prior", []) if row.get("id")]
+        prior_sources = [doc for vid in past_docs for doc in json.loads(require(c, "claims", vid)["refs"])]
+        earlier = delivery.earlier_work(c, r)
+        lead_ids = list(dict.fromkeys(i for lead in earlier[0] for i in lead["fragment_ids"]))
+        prior_sources.extend(
+            row[0]
+            for row in c.execute(
+                """SELECT DISTINCT a.document_id FROM fragments f JOIN evidence_assets a ON a.id=f.asset_id
+               JOIN event_docs d ON d.document_id=a.document_id WHERE d.event_id=?
+               AND f.id IN (SELECT value FROM json_each(?))""",
+                (r["event_id"], dump(lead_ids)),
+            )
+        )
+        research_docs = list(dict.fromkeys([*[d["id"] for d in docs], *prior_sources]))
+        review_fragments = materials.fragments_for(c, research_docs, per_document=None)
+        review = delivery.review_inputs(c, r, plan, review_fragments, earlier)
+        shown_ids = {f["id"] for f in review["交付可引用原文"]}
+        review_archive = {f["id"]: f for f in review_fragments if f["id"] in shown_ids}
+        # The author can cite the archived paragraphs carried from a prior snapshot as well.
+        already_shown = {d["id"] for d in docs}
+        for doc_id in dict.fromkeys(f["document_id"] for f in review_archive.values()):
+            if doc_id not in already_shown:
+                docs.append(require(c, "documents", doc_id))
     synthesis_ctx = {
         **ctx,
+        **review,
         "此前判断": old_judgments,
         "本轮研究": reports,
         "evidence": [{"id": d["id"], "title": d["title"], "summary": d["summary"][:600]} for d in docs],
@@ -983,6 +1378,30 @@ def run_round(worker, job, rid, candidates):
         )
     else:
         synthesis, _ = worker.call(job, "study", synthesis_ctx)
+    checked = delivery.inspect(plan, synthesis.delivery, review_archive)
+    incomplete = [row for row in checked if row["state"] in ("missing", "rejected")]
+    if incomplete and plan.get("checklist") and tasks and not budget_error:
+        try:
+            revised, _ = worker.call(
+                job,
+                "study",
+                {
+                    **synthesis_ctx,
+                    "交付前复核": {
+                        "原答复": [a.model_dump() for a in synthesis.delivery],
+                        "待修项": incomplete,
+                        "要求": "仅修复所列核查项。无法作答时交代证据缺口。",
+                    },
+                },
+            )
+        except (DispatchDeferred, RuntimeError, ValueError, OSError) as err:
+            synthesis.gaps.append("交付前补核未完成。" + str(err)[:200])
+        else:
+            ids_to_fix = {row["position"] for row in incomplete}
+            replacements = [a for a in revised.delivery if a.check_id in ids_to_fix]
+            supplied = {a.check_id for a in replacements}
+            synthesis.delivery = [a for a in synthesis.delivery if a.check_id not in supplied] + replacements
+            checked = delivery.inspect(plan, synthesis.delivery, review_archive)
     try:
         refs = worker.allowed(
             synthesis.evidence_ids,
@@ -996,10 +1415,43 @@ def run_round(worker, job, rid, candidates):
     with worker.store.connection(True) as c:
         if not workflow.goal_matches(c, r):
             return "研究目标已更新"
-        return publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job)
+        detail = publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job, checked=checked)
+        queue_failed_tasks(c, r, tasks, job["id"])
+        return detail
 
 
-def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job):
+def queue_failed_tasks(c, r, tasks, source_job):
+    failed = []
+    for task in tasks:
+        if task["state"] != "failed":
+            continue
+        if not c.execute(
+            "INSERT OR IGNORE INTO role_retry_sources VALUES(?,?)", (task["id"], source_job)
+        ).rowcount:
+            continue
+        attempt = c.execute(
+            """INSERT INTO role_retries VALUES(?,1) ON CONFLICT(task_id)
+                          DO UPDATE SET attempts=attempts+1 WHERE attempts<2 RETURNING attempts""",
+            (task["id"],),
+        ).fetchone()
+        if attempt:
+            failed.append((task["id"], attempt[0]))
+    if failed:
+        retry = enqueue(
+            c,
+            "research_retry",
+            event=r["event_id"],
+            args={
+                "round_id": r["id"],
+                "failed_tasks": [t for t, _ in failed],
+                "dispatch_key": "retry/" + workflow.fingerprint(failed),
+            },
+        )
+        delay = 45 * max(n for _, n in failed)
+        c.execute("UPDATE jobs SET retry_at=?,info=? WHERE id=?", (later(delay), "稍后自动补查失败的调查线", retry))
+
+
+def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job, *, checked=None):
     event = r["event_id"]
     rid = r["id"]
     signature = workflow.fingerprint(
@@ -1011,12 +1463,13 @@ def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job):
     if existing:
         return f"已发布知识版本 {existing['snapshot_id']}"
     last = workflow.latest(c, event)
-    frags = {f["id"]: f for i in [d["id"] for d in docs] for f in materials.fragments_for(c, [i])}
+    frags = {f["id"]: f for f in materials.fragments_for(c, [d["id"] for d in docs], per_document=None)}
     gaps = list(dict.fromkeys([*plan.get("postponed", []), *synthesis.gaps]))
     changes = []
     added = set()
     contributed = set()
     proposed_links = {w["entry_id"]: w for w in plan.get("use_knowledge", [])}
+    decisions = {(v.task_id, v.finding): v for v in synthesis.publication}
     index_notes = {}
     excluded = {
         w[0]
@@ -1034,16 +1487,59 @@ def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job):
         if task["state"] != "done":
             gaps.append(f"{ROLE_NAMES[task['role']]} · {task['detail'] or '尚未完成'}")
             continue
+        for proposed in Report.model_validate_json(task["result"]).findings:
+            conflict = conflicting_support(c, proposed)
+            if conflict:
+                board.record_dispute(c, proposed.supports, event, proposed, conflict)
         report = validated_task_report(c, task)
         for link in report.use_knowledge:
             proposed_links.setdefault(link.entry_id, link.model_dump())
         gaps.extend(report.gaps)
-        for f in report.findings:
+        for pos, f in enumerate(report.findings, 1):
             gap = conflicting_support(c, f)
             if gap:
                 gaps.append(gap)
                 continue
-            ident, is_new = claim(c, event, task["role"], f, frags)
+            choice = decisions.get((task["id"], pos))
+            local = board.local_reason(f.kind, f.subject, f.text, f.facets)
+            if local or (choice.scope if choice else f.scope) == "event":
+                citations = [
+                    {
+                        "document_id": frags[x.fragment_id]["document_id"],
+                        "fragment_id": x.fragment_id,
+                        "quote": x.quote,
+                        "locator": frags[x.fragment_id]["locator"],
+                    }
+                    for x in f.citations
+                ]
+                board.note(
+                    c,
+                    event,
+                    r["goal_version"],
+                    task["question"],
+                    f.subject,
+                    f.text,
+                    f.kind,
+                    local or (choice.reason if choice else f.reason) or "事件专属材料",
+                    citations,
+                    rid=rid,
+                    task=task["id"],
+                )
+                if f.facets.get("预测ID"):
+                    c.execute(
+                        "INSERT OR IGNORE INTO round_prediction_gates VALUES(?,?,'checking')",
+                        (rid, f.facets["预测ID"]),
+                    )
+                continue
+            equivalent = board.indicator_parent(c, event, f)
+            if equivalent:
+                if json.loads(equivalent["attributes"])["value"] != f.attributes["value"]:
+                    conflict = f"同一指标、统计期和口径有两个值，待复核版本 #{equivalent['id']}"
+                    board.record_dispute(c, equivalent["id"], event, f, conflict)
+                    gaps.append(conflict)
+                    continue
+                f.supports, f.subject, f.text = equivalent["id"], equivalent["subject"], equivalent["text"]
+            ident, is_new = claim(c, event, task["role"], f, frags, task_id=task["id"])
             if task["role"] == "people" and f.entity_kind == "person":
                 people.adopt_claim(c, r, ident)
             contributed.add(ident)
@@ -1273,6 +1769,15 @@ def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job):
             (snap, link["version_id"], link.get("section", ""), link["reason"]),
         )
     c.execute("INSERT INTO round_publications VALUES(?,?,?)", (rid, signature, snap))
+    delivery.save(
+        c, snap, checked if checked is not None else delivery.inspect(plan, synthesis.delivery, frags)
+    )
+    c.execute(
+        """INSERT INTO snapshot_rejections SELECT ?,t.id,j.subject,j.reason FROM task_rejections j
+                 JOIN research_tasks t ON t.id=j.task_id WHERE t.round_id=?""",
+        (snap, rid),
+    )
+    board.notify(c, event, contributed)
     workflow.freeze_metadata(c, event, snap, [d["id"] for d in docs])
     workflow.refresh_shared_indexes(c, event, contributed)
     c.executemany(

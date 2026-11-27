@@ -1,8 +1,9 @@
+from datetime import timedelta
 import json
 
 import pytest
 
-from evosight import agents, db, feeds, market_sources, materials, watch
+from evosight import agents, db, feeds, market_sources, materials, research, watch
 from test_workflow import HOST, clock, new_event, setup
 
 
@@ -136,6 +137,8 @@ def test_filings_use_verified_cik_and_original_document():
 def test_empty_search_still_runs_source_scout_and_requires_real_evidence(tmp_path, clock, available):
     store, acq, replay, worker = setup(tmp_path, ["news"])
     event = new_event(store)
+    with store.connection() as c:
+        r = db.require(c, "tracking_rounds", event["round"])
 
     def offline(*args):
         raise OSError("search unavailable")
@@ -160,6 +163,7 @@ def test_empty_search_still_runs_source_scout_and_requires_real_evidence(tmp_pat
         if role == "source_scout":
             replay.calls[role] += 1
             assert context["previous_attempts"] and context["title"]
+            assert context["window"] == [r["window_start"], r["window_end"]]
             return agents.SourceScout(
                 publisher_urls=([HOST + "/notice"] if available else []) + [unrelated], queries=[]
             ), (3, 2)
@@ -185,6 +189,51 @@ def test_empty_search_still_runs_source_scout_and_requires_real_evidence(tmp_pat
             assert chosen == [HOST + "/notice"] and count and replay.calls["news"] and state[0] == "published"
         else:
             assert not chosen and count == 0 and state[0] == "waiting" and "未取得可核实" in state[1]
+
+
+def test_planned_news_search_excludes_publications_after_round_cutoff(tmp_path, clock):
+    store, acq, _, worker = setup(tmp_path, ["news"])
+    event = new_event(store)
+    plan = agents.Plan.model_validate(
+        {
+            "rationale": "核对本轮公告",
+            "tasks": [
+                {
+                    "role": "news",
+                    "question": "有哪些新公告？",
+                    "target": "海岚市域线",
+                    "time_scope": "window",
+                    "done_when": "核对发布方原文",
+                    "priority": 2,
+                    "search_query": "海岚市域线 公告",
+                }
+            ],
+        }
+    )
+    with store.connection(True) as c:
+        r = db.require(c, "tracking_rounds", event["round"])
+        research.save_plan(c, r, plan)
+        task = db.one(c, "SELECT * FROM research_tasks WHERE round_id=?", (r["id"],))
+
+    def article(slug, published):
+        url = HOST + "/" + slug
+        return (
+            {"url": url, "title": slug, "summary": slug, "published_at": published},
+            feeds.Resource(slug.encode(), url, "text/html"),
+            materials.Extract("html", [("paragraph", slug, url)], published_at=published),
+        )
+
+    cutoff = r["window_end"]
+    acq.targeted = lambda _: [
+        article("after-cutoff", clock.utc(clock.dt + timedelta(seconds=1))),
+        article("at-cutoff", cutoff),
+    ]
+    docs = research.prepare_task(worker, r, task, plan.tasks[0].model_dump(), {}, [])
+    with store.connection() as c:
+        assert [row[0] for row in c.execute("SELECT url FROM documents")] == [HOST + "/at-cutoff"]
+        fragments = materials.fragments_for(c, docs)
+        assert research.model_fragments(fragments)[0]["published_at"] == cutoff
+        assert "published_at" not in research.model_fragments([{**fragments[0], "source_times_checked": 0}])[0]
 
 
 def test_catalog_matches_the_issuer_and_goal():

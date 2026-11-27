@@ -16,7 +16,7 @@ def main():
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--data", default="data")
     serve.add_argument("--demo", action="store_true", help="添加两条明确标记的虚构演示事件")
-    smoke = commands.add_parser("smoke", help="用真实公开来源和两个低强度模型执行一轮试跑")
+    smoke = commands.add_parser("smoke", help="用真实公开来源和低推理强度执行一轮试跑")
     smoke.add_argument("--data", default=".work/smoke", help="指定一个无其他任务的试跑数据库目录")
     check = commands.add_parser("check-feed", help="验证公开 RSS/Atom 的条目和时间字段")
     check.add_argument("url")

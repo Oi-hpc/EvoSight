@@ -20,6 +20,15 @@ def fingerprint(*values):
     return hashlib.sha256(dump(values).encode()).hexdigest()
 
 
+def main_lane(event):
+    return f"{event or 'workspace'}/main"
+
+
+def main_session_backend(c, event):
+    row = one(c, "SELECT backend FROM agent_sessions WHERE lane=?", (main_lane(event),))
+    return row["backend"] if row else None
+
+
 def current_goal(c, event):
     goal = one(c, "SELECT * FROM event_goals WHERE event_id=? ORDER BY version DESC LIMIT 1", (event,))
     if not goal:
@@ -340,6 +349,11 @@ def list_rounds(c, event, rid=None):
         )
         for t in r["tasks"]:
             t["role_name"] = ROLE_NAMES[t["role"]]
+            t["rejections"] = rows(
+                c,
+                "SELECT subject,reason FROM task_rejections WHERE task_id=? ORDER BY subject,reason",
+                (t["id"],),
+            )
         r["coverage"] = rows(
             c,
             "SELECT url,state,window_start,window_end,checked_at,recovery_round FROM round_sources WHERE round_id=?",
@@ -390,6 +404,9 @@ def knowledge(c, event, *, section=None, revision=None, compare=None, query=""):
     snap = owned(revision) if revision else latest(c, event)
     base = owned(compare) if compare else None
     items = snapshot_claims(c, snap["id"]) if snap else []
+    if not revision:
+        hidden = {row[0] for row in c.execute("SELECT entry_id FROM world_dispositions")}
+        items = [item for item in items if item["world_id"] not in hidden]
     inherited = snapshot_claims(c, base["id"]) if base else []
     ids = {v["id"] for v in items}
     old = {v["id"] for v in inherited}
@@ -482,12 +499,30 @@ def knowledge(c, event, *, section=None, revision=None, compare=None, query=""):
         one(c, "SELECT payload FROM snapshot_contexts WHERE snapshot_id=?", (revision,)) if revision else None
     )
     result.update(json.loads(frozen["payload"]) if frozen else metadata(c, event))
+    from . import delivery
+
+    report_version = delivery.latest_research_snapshot(c, snap["id"]) if snap else None
+    result["delivery_snapshot"] = report_version
+    result["delivery"] = delivery.view(c, report_version) if report_version else []
+    result["rejections"] = (
+        rows(
+            c,
+            "SELECT task_id,subject,reason FROM snapshot_rejections WHERE snapshot_id=? ORDER BY task_id,subject",
+            (report_version,),
+        )
+        if report_version
+        else []
+    )
     return result
 
 
 def metadata(c, event):
+    from . import board
+
+    goal = current_goal(c, event)
     return {
-        "goal": current_goal(c, event),
+        "goal": goal,
+        "board": board.view(c, event, goal["version"]),
         "event_status": require(c, "events", event)["status"],
         "lessons": applicable_lessons(c, event),
         "sources": rows(
@@ -736,6 +771,8 @@ def reference_world(c, event, entry, version_id, expected, reason, section=""):
     if e["demo"]:
         raise ValueError("演示事件只供阅读")
     v = world.version(c, version_id)
+    if one(c, "SELECT 1 FROM world_dispositions WHERE entry_id=?", (entry,)):
+        raise ValueError("该版本已转为事件资料、撤回或合并，请核对当前可引用条目")
     if not v or v["entry_id"] != entry or v["demo"] != e["demo"]:
         raise KeyError("找不到可引用的世界知识")
     old = latest(c, event)

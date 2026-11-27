@@ -514,7 +514,8 @@ class Acquisition:
 
     def targeted(self, query):
         results = []
-        for label, raw in self.search(query, 4):
+        candidates = [("", query)] if query.lower().startswith(("https://", "http://")) else self.search(query, 4)
+        for label, raw in candidates:
             url = safe_link("", raw)
             if not url:
                 continue
@@ -572,6 +573,22 @@ def save_asset(c, doc, url, kind, body, mime, result, *, extractor="publisher-v1
                 for child_kind, link in prioritized[:4]
             ],
         )
+    if (
+        not existing
+        and digest
+        and (kind in ("daily_prices", "sec_filings") or kind == "html" and b"application/ld+json" in body)
+    ):
+        from . import cards, world_search
+
+        if cards.publisher(c, {"asset_id": asset, "asset_url": url, "kind": kind, "digest": digest})[0]:
+            for entry in rows(
+                c,
+                """SELECT w.id,w.head_id FROM world_entries w JOIN claims k ON k.id=w.head_id
+                             WHERE EXISTS(SELECT 1 FROM json_each(k.refs) WHERE value=?)""",
+                (doc,),
+            ):
+                cards.refresh(c, entry["head_id"])
+                world_search.index_head(c, entry["id"])
     return asset
 
 
@@ -714,19 +731,20 @@ def enrich(store, acquisition, doc):
             )
 
 
-def fragments_for(c, doc_ids):
+def fragments_for(c, doc_ids, *, per_document=12):
     # Round-robin across documents; one long PDF cannot evict all other sources.
     groups = []
     for doc in doc_ids:
         group = rows(
             c,
             """SELECT f.id,a.document_id,f.locator,f.text,f.link,a.kind,d.title,d.url,
-                          d.published_at,d.source_times_checked FROM fragments f JOIN evidence_assets a ON a.id=f.asset_id
+                          d.published_at,d.source_updated_at,d.source_times_checked
+                          FROM fragments f JOIN evidence_assets a ON a.id=f.asset_id
                           JOIN documents d ON d.id=a.document_id WHERE a.document_id=?
                           AND (a.extractor!='feed-v1' OR NOT EXISTS (SELECT 1 FROM evidence_assets x
                             WHERE x.document_id=a.document_id AND x.extractor='publisher-record-v1' AND x.state='ready'))
-                          ORDER BY CASE a.kind WHEN 'feed' THEN 1 ELSE 0 END,f.id LIMIT 12""",
-            (doc,),
+                          ORDER BY CASE a.kind WHEN 'feed' THEN 1 ELSE 0 END,f.id LIMIT ?""",
+            (doc, per_document if per_document is not None else -1),
         )
         groups.append(group)
-    return [group[i] for i in range(12) for group in groups if i < len(group)]
+    return [group[i] for i in range(max(map(len, groups), default=0)) for group in groups if i < len(group)]

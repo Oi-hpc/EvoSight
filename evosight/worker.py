@@ -9,8 +9,21 @@ import time
 import uuid
 from datetime import datetime, timedelta
 
-from . import discussion, feeds, forecast, materials, research, resources, scenarios, watch, workflow
-from .agents import Runner, CONTRACTS, DiscussionAnswer
+from . import (
+    agent_tools,
+    board,
+    delivery,
+    discussion,
+    feeds,
+    forecast,
+    materials,
+    research,
+    resources,
+    scenarios,
+    watch,
+    workflow,
+)
+from .agents import Runner, CONTRACTS, DiscussionAnswer, backend_setting
 from .db import (
     DispatchDeferred,
     add_event,
@@ -18,6 +31,7 @@ from .db import (
     config,
     dump,
     enqueue,
+    job_lease,
     instant,
     later,
     node,
@@ -295,23 +309,31 @@ class Worker:
             )
             if not job:
                 return False
+            token = uuid.uuid4().hex
             c.execute(
                 "UPDATE jobs SET status='running',attempts=attempts+1,owner=?,started_at=?,lease=? WHERE id=?",
-                (self.owner, utc(), later(90), job["id"]),
+                (token, utc(), later(90), job["id"]),
             )
         done = threading.Event()
 
         def heartbeat():
             while not done.wait(20):
-                with self.store.connection(True) as c:
-                    c.execute(
-                        "UPDATE jobs SET lease=? WHERE id=? AND owner=? AND status='running'",
-                        (later(90), job["id"], self.owner),
-                    )
+                try:
+                    with self.store.connection(True) as c:
+                        renewed = c.execute(
+                            "UPDATE jobs SET lease=? WHERE id=? AND owner=? AND status='running' AND lease>=?",
+                            (later(90), job["id"], token, utc()),
+                        )
+                        if not renewed.rowcount:
+                            log.warning("任务 %s 已失去租约", job["id"])
+                            return
+                except sqlite3.Error:
+                    log.exception("任务 %s 续租失败", job["id"])
 
         thread = threading.Thread(target=heartbeat, daemon=True)
         thread.start()
         status = "done"
+        lease_context = job_lease.set((self.store.path, job["id"], token))
         try:
             msg = self.process(job)
         except resources.ResourcePressure as err:
@@ -325,24 +347,31 @@ class Worker:
             log.exception("任务执行失败")
             msg, status = "任务异常，已保留已采集的材料", "failed"
         finally:
+            job_lease.reset(lease_context)
             done.set()
             thread.join(timeout=2)
         with self.store.connection(True) as c:
+            if not one(
+                c,
+                "SELECT 1 FROM jobs WHERE id=? AND owner=? AND status='running' AND lease>=?",
+                (job["id"], token, utc()),
+            ):
+                return True
             if status == "resource_wait":
                 c.execute(
                     """UPDATE jobs SET status='queued',info=?,retry_at=?,owner=NULL,lease=NULL,
                        attempts=max(0,attempts-1) WHERE id=? AND owner=?""",
-                    (msg, later(15), job["id"], self.owner),
+                    (msg, later(15), job["id"], token),
                 )
             elif status == "failed" and job["attempts"] < 1 and not self.stop.is_set():
                 c.execute(
                     "UPDATE jobs SET status='queued',info=?,retry_at=?,owner=NULL WHERE id=? AND owner=?",
-                    (msg, later(45), job["id"], self.owner),
+                    (msg, later(45), job["id"], token),
                 )
             else:
                 c.execute(
                     "UPDATE jobs SET status=?,info=?,finished_at=?,owner=NULL WHERE id=? AND owner=?",
-                    (status, msg, utc(), job["id"], self.owner),
+                    (status, msg, utc(), job["id"], token),
                 )
                 rid = json.loads(job["args"]).get("round_id")
                 if rid and status == "done":
@@ -379,11 +408,51 @@ class Worker:
         value, model, _ = self.call_recorded(job, role, ctx)
         return value, model
 
+    def profile(self, role, limits, session_backend=None):
+        if isinstance(self.runner, Runner):
+            return self.runner.profile(role, limits[backend_setting(role)], session_backend=session_backend)
+        return self.runner.profile(role)
+
     def call_recorded(self, job, role, ctx):
-        model, effort = self.runner.profile(role)
-        input_hash = workflow.fingerprint(model, effort, ctx)
+        if job.get("event_id") and "demo" not in ctx:
+            with self.store.connection() as c:
+                if require(c, "events", job["event_id"])["demo"]:
+                    ctx = {**ctx, "demo": True}
+        lane = None
+        old_lane = None
+        recipient = "主 Agent"
+        event_key = job.get("event_id") or "workspace"
+        if not agent_tools.frozen(role, ctx):
+            task = ctx.get("task")
+            if task:
+                line = task.get("line") or task.get("target") or task["question"]
+                recipient = task.get("line") or f"{role}/{line}"
+                lane = f"{event_key}/scout/{workflow.fingerprint(recipient)[:24]}"
+                old_lane = f"{event_key}/scout/{workflow.fingerprint(role,line)[:24]}"
+            else:
+                lane = workflow.main_lane(job.get("event_id"))
+        session = {}
+        profile = None
         while True:
             with self.store.connection(True) as c:
+                if lane:
+                    if old_lane:
+                        c.execute(
+                            """UPDATE OR IGNORE agent_sessions SET lane=? WHERE lane=?
+                                     AND NOT EXISTS(SELECT 1 FROM agent_sessions WHERE lane=?)""",
+                            (lane, old_lane, lane),
+                        )
+                    c.execute("INSERT OR IGNORE INTO agent_sessions(lane) VALUES(?)", (lane,))
+                    session = one(
+                        c,
+                        """SELECT s.*,r.status AS busy FROM agent_sessions s LEFT JOIN runs r
+                                   ON r.id=s.busy_run WHERE s.lane=?""",
+                        (lane,),
+                    )
+                current_profile = self.profile(role, config(c), session.get("backend"))
+                if current_profile != profile:
+                    model, effort = profile = current_profile
+                    input_hash = workflow.fingerprint(model, effort, ctx)
                 saved = one(
                     c,
                     "SELECT response,model,run_id FROM model_receipts WHERE job_id=? AND role=? AND input_hash=?",
@@ -404,16 +473,55 @@ class Worker:
                     WHERE r.job_id=? AND r.role=? AND i.input_hash=? AND r.status='running' LIMIT 1""",
                     (job["id"], role, input_hash),
                 )
-                if not same_input and slots["active"] < slots["effective"]:
+                if (
+                    not same_input
+                    and session.get("busy") != "running"
+                    and slots["active"] < slots["effective"]
+                ):
                     run = book_run(c, job["id"], role, model, effort)
-                    c.execute("INSERT INTO run_inputs VALUES(?,?,?)", (run, input_hash, dump(ctx)))
+                    prompt_ctx = dict(ctx)
+                    messages = (
+                        board.inbox(c, job["event_id"], recipient) if lane and job.get("event_id") else []
+                    )
+                    if messages:
+                        prompt_ctx["待处理交接"] = messages
+                    if session.get("last_run"):
+                        prompt_ctx["调查检查点"] = json.loads(session["checkpoint"])
+                    if isinstance(self.runner, Runner):
+                        files = agent_tools.archive_ids(c, ctx)
+                        if files:
+                            prompt_ctx["archive_fragment_ids"] = files
+                    c.execute("INSERT INTO run_inputs VALUES(?,?,?)", (run, input_hash, dump(prompt_ctx)))
+                    if lane:
+                        backend = "dsh" if model.startswith("dashscope/") else "codex"
+                        c.execute(
+                            "UPDATE agent_sessions SET busy_run=?,backend=COALESCE(backend,?) WHERE lane=?",
+                            (run, backend, lane),
+                        )
                     break
                 if not slots["effective"] and not slots["active"]:
                     raise resources.ResourcePressure("可用内存不足，等待资源恢复后继续")
             self.stop.wait(0.25)
         start = time.monotonic()
         try:
-            value, tokens = self.runner.call(role, ctx)
+            session_column = "dsh_session_id" if model.startswith("dashscope/") else "thread_id"
+            requested_thread = session.get(session_column)
+            thread_id = requested_thread
+            if isinstance(self.runner, Runner):
+                directory = (
+                    self.store.directory / "agent-workspaces" / workflow.fingerprint(lane)[:24]
+                    if lane
+                    else None
+                )
+                archive = []
+                if prompt_ctx.get("archive_fragment_ids"):
+                    with self.store.connection() as c:
+                        archive = agent_tools.read_archive(c, prompt_ctx["archive_fragment_ids"])
+                value, tokens, thread_id, model = self.runner.turn(
+                    role, prompt_ctx, directory, requested_thread, profile=(model, effort), archive=archive,
+                )
+            else:
+                value, tokens = self.runner.call(role, prompt_ctx)
             if role in ("discuss_codex", "discuss_dsh"):
                 discussion.validate_answer(value, ctx)
             elif role == "forecast":
@@ -441,8 +549,35 @@ class Worker:
                 (job["id"], role, input_hash, value.model_dump_json(), model, run),
             )
             c.execute(
-                "UPDATE runs SET status='done',elapsed=?,input_tokens=?,output_tokens=? WHERE id=?",
-                (time.monotonic() - start, *tokens, run),
+                "UPDATE runs SET status='done',elapsed=?,input_tokens=?,output_tokens=?,model=? WHERE id=?",
+                (time.monotonic() - start, *tokens, model, run),
+            )
+            if lane:
+                c.executemany(
+                    "UPDATE handoff_inbox SET received_run=? WHERE note_id=? AND received_run IS NULL",
+                    [(run, message["id"]) for message in messages],
+                )
+                checkpoint = {
+                    "role": role,
+                    "run": run,
+                    "goal_version": ctx.get("goal_version"),
+                    "question": (ctx.get("task") or {}).get("question"),
+                    "last_result": value.model_dump_json()[:1800],
+                }
+                c.execute(
+                    f"""UPDATE agent_sessions SET {session_column}=COALESCE(?,{session_column}),
+                               last_run=?,checkpoint=?,busy_run=NULL WHERE lane=? AND busy_run=?""",
+                    (thread_id, run, dump(checkpoint), lane, run),
+                )
+            c.execute(
+                "INSERT INTO run_sessions VALUES(?,?,?,?,?)",
+                (
+                    run,
+                    lane,
+                    session.get("last_run"),
+                    requested_thread,
+                    thread_id if isinstance(self.runner, Runner) else None,
+                ),
             )
             if not receipt.rowcount:
                 saved = one(
@@ -528,6 +663,11 @@ class Worker:
                 run = None
             else:
                 answer, _, run = self.call_recorded(job, "discuss_" + turn["provider"], ctx)
+                if answer.kind == "lookup":
+                    ctx = discussion.retrieve_web_sources(self.acquisition, ctx, answer.source_urls)
+                    with self.store.connection(True) as c:
+                        c.execute("UPDATE discussion_turns SET context=? WHERE id=?", (dump(ctx), turn["id"]))
+                    answer, _, run = self.call_recorded(job, "discuss_" + turn["provider"], ctx)
             with self.store.connection(True) as c:
                 existing = one(c, "SELECT info FROM job_results WHERE job_id=?", (job["id"],))
                 if existing:
@@ -611,7 +751,16 @@ class Worker:
                     candidates(c, draft.discoveries, None, current, refs, sources)
                 return self.receipt(c, job, f"发现 {len(draft.discoveries)} 个候选")
         if job["kind"] in ("collect", "research_retry"):
+            if args.get("failed_tasks"):
+                with self.store.connection(True) as c:
+                    c.execute(
+                        """UPDATE research_tasks SET state='queued' WHERE round_id=? AND state='failed'
+                              AND id IN (SELECT value FROM json_each(?))""",
+                        (args["round_id"], dump(args["failed_tasks"])),
+                    )
             return research.run_round(self, job, args.get("round_id"), candidates)
+        if job["kind"] == "guide_check":
+            return research.run_guide(self, job, args, candidates)
         with self.store.connection() as c:
             docs = evidence(c, event, limit=22)
             snapshot = workflow.latest(c, event)
@@ -672,11 +821,103 @@ class Worker:
                     return "已有预测正在核验，等待决定性证据"
                 ctx["已有预测"] = available
                 ctx["evidence_fragments"] = forecast_fragments(c, docs)
+                if snapshot:
+                    frozen = one(
+                        c, "SELECT payload FROM snapshot_contexts WHERE snapshot_id=?", (snapshot["id"],)
+                    )
+                    frozen_board = json.loads(frozen["payload"]).get("board", {}) if frozen else {}
+                    ctx["本轮正式核查报告"] = [
+                        row
+                        for row in delivery.view(c, snapshot["id"])
+                        if row["state"] in ("confirmed", "unknown")
+                    ]
+                    ctx["待核查的事件材料"] = [
+                        {"subject": n["subject"], "reason": n["reason"]}
+                        for n in frozen_board.get("notes", [])[:6]
+                    ]
+                    ctx["已采用的知识"] = [
+                        {"subject": k["subject"], "text": k["text"], "refs": k["refs"], "version_id": k["id"]}
+                        for k in workflow.snapshot_claims(c, snapshot["id"])[:12]
+                    ]
             if not docs:
                 return self.note(job, event, fixed, "暂无可引用的证据")
             if job["attempts"] and job["info"]:
                 ctx["上次校验反馈"] = job["info"]
-            draft, model, run = self.call_recorded(job, "forecast", {**ctx, "evidence": compact(docs)})
+            context = {**ctx, "evidence": compact(docs)}
+            draft, model, run = self.call_recorded(job, "forecast", context)
+            if draft.action != "hold" and (fixed or draft.scale or draft.action == "revise"):
+                author_run = run
+                registration = fixed or next((p for p in ctx["已有预测"] if p["id"] == draft.prediction_id), None)
+                if not registration:
+                    registration = {
+                        "question": draft.question,
+                        "deadline": draft.deadline,
+                        "rule": draft.rule,
+                        "authority": draft.authority,
+                        "scale": draft.scale.model_dump() if draft.scale else None,
+                    }
+                blind_question = {
+                    k: v
+                    for k, v in registration.items()
+                    if k in ("question", "deadline", "rule", "authority", "window_start", "scale")
+                }
+                if not blind_question.get("scale") and draft.scale:
+                    blind_question["scale"] = draft.scale.model_dump()
+                blind_question["form"] = "ordered" if blind_question.get("scale") else "binary"
+                independent = {
+                    "独立复核": True,
+                    "固定题": blind_question,
+                    "evidence": context["evidence"],
+                    "已有预测": [],
+                    "evidence_fragments": context["evidence_fragments"],
+                }
+                with self.store.connection() as c:
+                    recorded = one(
+                        c, "SELECT json_extract(payload,'$.archive_fragment_ids') AS files FROM run_inputs WHERE run_id=?",
+                        (author_run,),
+                    )
+                    if recorded and recorded["files"]:
+                        independent["archive_fragment_ids"] = json.loads(recorded["files"])
+                if draft.action == "revise":
+                    independent.pop("固定题")
+                    independent["已有预测"] = [
+                        {
+                            k: registration[k]
+                            for k in ("id", "question", "rule", "authority", "deadline", "scale")
+                            if k in registration
+                        }
+                    ]
+                second, _, review_run = self.call_recorded(job, "forecast", independent)
+                disagreement = (
+                    second.action == "hold"
+                    or bool(draft.outlook) != bool(second.outlook)
+                    or (
+                        draft.outlook
+                        and second.outlook
+                        and draft.outlook.primary_level != second.outlook.primary_level
+                    )
+                    or (
+                        draft.p is not None
+                        and second.p is not None
+                        and (abs(draft.p - second.p) >= 15 or (draft.p - 50) * (second.p - 50) < 0)
+                    )
+                )
+                if disagreement:
+                    draft, model, run = self.call_recorded(
+                        job,
+                        "forecast",
+                        {
+                            **context,
+                            "作者初稿": draft.model_dump(),
+                            "独立意见": second.model_dump(),
+                            "复核要求": "逐项核对分歧、依据和反证，输出最终决定并在 reason 说明理由。",
+                        },
+                    )
+                with self.store.connection(True) as c:
+                    c.execute(
+                        "INSERT OR REPLACE INTO forecast_reviews VALUES(?,?,?,?,?)",
+                        (job["id"], author_run, review_run, run, "分歧已复议" if disagreement else "独立判断一致"),
+                    )
             if draft.action == "hold":
                 return self.note(job, event, fixed, draft.reason)
             refs = self.allowed(draft.evidence_ids, docs)
