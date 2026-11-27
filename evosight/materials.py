@@ -4,8 +4,11 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
+from contextlib import closing
 from dataclasses import dataclass, field
+from http.client import HTTPException, HTTPSConnection
 from urllib.parse import quote, urljoin, urlsplit
 
 from lxml import etree, html
@@ -153,6 +156,8 @@ def catalog(title, scope):
 
 
 def search_web(query, maximum=4):
+    if os.getenv("EVOSIGHT_PUBLIC_SEARCH") == "deepseek":
+        return deepseek_search(query, maximum)
     from ddgs import DDGS
     from ddgs.exceptions import DDGSException
 
@@ -163,6 +168,35 @@ def search_web(query, maximum=4):
             return []
         raise RuntimeError("公开搜索服务暂不可用") from exc
     return [(r.get("title", ""), r.get("href") or r.get("url", "")) for r in results]
+
+
+def deepseek_search(query, maximum):
+    key = os.getenv("DEEPSEEK_API_KEY")
+    if not key:
+        raise RuntimeError("未配置 DeepSeek 搜索凭据")
+    query = query.strip()[:128]
+    if not query:
+        return []
+    count = min(maximum, 50)
+    body = json.dumps({"query": query, "count": count, "need_content": False}, ensure_ascii=False).encode()
+    try:
+        with closing(HTTPSConnection("api.deepseek.com", timeout=10)) as connection:
+            connection.request(
+                "POST", "/v1/tools/search", body,
+                {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            if response.status != 200:
+                raise RuntimeError(f"DeepSeek 搜索返回 HTTP {response.status}")
+            results = json.loads(response.read(512_000)).get("results")
+    except (OSError, HTTPException, ValueError, AttributeError) as exc:
+        raise RuntimeError("DeepSeek 搜索服务暂不可用") from exc
+    if not isinstance(results, list):
+        raise RuntimeError("DeepSeek 搜索结果格式无效")
+    return [
+        (r["title"], r["url"]) for r in results[:count]
+        if isinstance(r, dict) and isinstance(r.get("title"), str) and isinstance(r.get("url"), str)
+    ]
 
 
 def tree_for(resource):

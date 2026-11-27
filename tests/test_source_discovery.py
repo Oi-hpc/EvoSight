@@ -191,6 +191,35 @@ def test_empty_search_still_runs_source_scout_and_requires_real_evidence(tmp_pat
             assert not chosen and count == 0 and state[0] == "waiting" and "未取得可核实" in state[1]
 
 
+def test_program_search_can_use_the_deployed_deepseek_provider(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("EVOSIGHT_PUBLIC_SEARCH", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-key")
+    request = []
+
+    class SearchService:
+        def __init__(self, address, timeout):
+            assert address == "api.deepseek.com" and timeout == 10
+
+        def request(self, method, path, payload, headers):
+            request.append((method, path, json.loads(payload), headers))
+
+        def getresponse(self):
+            return SimpleNamespace(status=200, read=lambda _: b'{"results":[{"url":"https://example.org/news","title":"News"}]}')
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(materials, "HTTPSConnection", SearchService)
+    assert materials.search_web("项" * 150, 4) == [("News", "https://example.org/news")]
+    method, path, payload, headers = request[0]
+    assert (method, path) == ("POST", "/v1/tools/search")
+    assert payload == {"query": "项" * 128, "count": 4, "need_content": False}
+    assert headers["Authorization"] == "Bearer fixture-key"
+
+
 def test_planned_news_search_excludes_publications_after_round_cutoff(tmp_path, clock):
     store, acq, _, worker = setup(tmp_path, ["news"])
     event = new_event(store)

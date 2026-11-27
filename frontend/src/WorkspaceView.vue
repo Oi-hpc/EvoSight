@@ -351,7 +351,7 @@ const shown = computed(
               <option value="dsh">DSH / Kimi</option>
             </select>
           </label>
-          <label class="field"><span>新建新闻侦查 Agent 默认后端</span>
+          <label class="field"><span>新建新闻侦查和探索补源 Agent 默认后端</span>
             <select v-model="limits.news_agent_backend" aria-describedby="news-search-capability">
               <option value="dsh">DSH / Kimi</option>
               <option value="codex">Codex</option>

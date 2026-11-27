@@ -154,7 +154,7 @@ def test_scout_reads_named_document_and_delivers_handoff_to_its_recipient(tmp_pa
 
         def call(self, role, ctx):
             assert ctx["待处理交接"][0]["documents"] == [doc]
-            return agents.SourceScout(publisher_urls=[], queries=[]), (1, 1)
+            return agents.Plan(rationale="核对交接文档", tasks=[]), (1, 1)
 
     store = db.Store(tmp_path)
     worker = Worker(store, Reader())
@@ -186,7 +186,7 @@ def test_scout_reads_named_document_and_delivers_handoff_to_its_recipient(tmp_pa
     with store.connection() as c:
         assert not board.inbox(c, event, "另一条调查线")
         assert len(board.inbox(c, event, "主 Agent")) == 1
-    worker.call(job, "source_scout", {})
+    worker.call(job, "plan", {})
     with store.connection() as c:
         assert not board.inbox(c, event, "主 Agent")
         assert c.execute("SELECT received_run FROM handoff_inbox").fetchone()[0] is not None

@@ -77,8 +77,9 @@ def choose(store, acq, event, rid, refresh=False, scout=None, empty_sources=()):
             )
         except (DispatchDeferred, resources.ResourcePressure):
             raise
-        except (ValueError, RuntimeError, OSError):
-            attempts.append(("探索 Agent", "本次未取得可用的查源建议，下轮可重试"))
+        except (ValueError, RuntimeError, OSError) as exc:
+            reason = "查源模型请求超时" if str(exc) == "模型请求超时" else "本次未取得可用的查源建议"
+            attempts.append(("探索补源", reason + "，下轮可重试"))
         else:
             extra, logs = acq.scout_sources(e["title"], e["scope"], suggestion)
             found = list({s.url: s for s in [*extra, *found]}.values())

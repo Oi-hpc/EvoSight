@@ -429,6 +429,9 @@ class Worker:
                 recipient = task.get("line") or f"{role}/{line}"
                 lane = f"{event_key}/scout/{workflow.fingerprint(recipient)[:24]}"
                 old_lane = f"{event_key}/scout/{workflow.fingerprint(role,line)[:24]}"
+            elif role == "source_scout":
+                recipient = "探索补源"
+                lane = f"{event_key}/source-scout"
             else:
                 lane = workflow.main_lane(job.get("event_id"))
         session = {}

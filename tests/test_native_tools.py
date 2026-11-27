@@ -57,8 +57,9 @@ def test_native_permissions_and_files_are_per_turn(tmp_path, monkeypatch):
 
     monkeypatch.setattr(agents, "run_cli", capture)
     runner = agents.Runner("test")
-    runner.turn("source_scout", {"basis": "latest"}, lane, archive=[f])
-    runner.turn("source_scout", {"basis": "original"}, archive=[f])
+    profile = runner.profile("source_scout", "codex")
+    runner.turn("source_scout", {"basis": "latest"}, lane, archive=[f], profile=profile)
+    runner.turn("source_scout", {"basis": "original"}, archive=[f], profile=profile)
     assert [mode for _, mode in seen] == ["live", "disabled"]
     assert seen[0][0] != seen[1][0] and all(not path.exists() for path, _ in seen)
     for role, ctx in [

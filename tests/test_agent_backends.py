@@ -12,7 +12,7 @@ def test_profiles_respect_explicit_choices_and_carry_failures_to_the_queue(monke
     for mode, codex, effort in (("test", "gpt-6.2-sol", "low"), ("live", "gpt-6.2-astra", "max")):
         runner = agents.Runner(mode)
         for role in agents.CONTRACTS:
-            assert runner.profile(role) == (dsh if role in ("discuss_dsh", "news") else codex, effort)
+            assert runner.profile(role) == (dsh if role in ("discuss_dsh", "news", "source_scout") else codex, effort)
             assert runner.profile(role, "dsh") == (codex if role == "discuss_codex" else dsh, effort)
 
     runner = agents.Runner("test")
@@ -169,14 +169,16 @@ def test_news_backend_setting_applies_to_new_lines_and_retry_keeps_dsh_session(t
         settings = api.get("/api/operations").json()
         limits = settings["limits"]
         assert limits["news_agent_backend"] == "dsh" and limits["agent_backend"] == "codex"
-        assert settings["profiles"]["news"][0] == dsh and settings["profiles"]["plan"][0] == codex
+        assert settings["profiles"]["news"][0] == settings["profiles"]["source_scout"][0] == dsh
+        assert settings["profiles"]["plan"][0] == codex
         assert Worker(store, runner).call_recorded(job, "news", context)[1] == dsh
         assert api.post("/api/settings", json={**limits, "news_agent_backend": "codex"}).status_code == 200
         assert api.post("/api/settings", json={k: v for k, v in limits.items() if k != "news_agent_backend"}).json()[
             "news_agent_backend"
         ] == "codex"
         assert api.post("/api/settings", json={**limits, "news_agent_backend": "typo"}).status_code == 422
-        assert api.get("/api/operations").json()["profiles"]["news"][0] == codex
+        profiles = api.get("/api/operations").json()["profiles"]
+        assert profiles["news"][0] == profiles["source_scout"][0] == codex
 
     store = db.Store(tmp_path)
     worker = Worker(store, agents.Runner("test"))
@@ -202,7 +204,7 @@ def test_research_lanes_keep_their_backend_across_restarts_and_database_upgrade(
     monkeypatch.setattr(
         runner, "_invoke",
         lambda role, ctx, model, effort, directory, thread_id, archive=(): (
-            agents.SourceScout(publisher_urls=[], queries=[]), (1, 1),
+            agents.Plan(rationale="核对工作区", tasks=[]), (1, 1),
             "saved-codex" if model.startswith("gpt-") else None, model,
         ),
     )
@@ -214,10 +216,10 @@ def test_research_lanes_keep_their_backend_across_restarts_and_database_upgrade(
     other_line = {"question": "核查交割条件"}
     codex = "gpt-6.2-sol"
     dsh = "dashscope/kimi-k3.1-pro"
-    assert worker.call_recorded(job, "source_scout", {})[1] == codex
-    assert worker.call_recorded(job, "source_scout", {"task": first_line})[1] == codex
+    assert worker.call_recorded(job, "plan", {})[1] == codex
+    assert worker.call_recorded(job, "plan", {"task": first_line})[1] == codex
     monkeypatch.setenv("EVOSIGHT_RESEARCH_BACKEND", "dsh")
-    assert worker.call_recorded(job, "source_scout", {"task": other_line})[1] == dsh
+    assert worker.call_recorded(job, "plan", {"task": other_line})[1] == dsh
     with store.connection(True) as c:
         c.execute("UPDATE settings SET value=? WHERE key='agent_backend'", (db.dump("dsh"),))
         c.execute("ALTER TABLE agent_sessions DROP COLUMN backend")
@@ -226,7 +228,38 @@ def test_research_lanes_keep_their_backend_across_restarts_and_database_upgrade(
     with reopened.connection() as c:
         assert workflow.main_session_backend(c, event) == "codex"
         assert workflow.main_session_backend(c, None) is None
-    assert worker.call_recorded(job, "source_scout", {"round": 2})[1] == codex
-    assert worker.call_recorded(job, "source_scout", {"task": first_line, "round": 2})[1] == codex
+    assert worker.call_recorded(job, "plan", {"round": 2})[1] == codex
+    assert worker.call_recorded(job, "plan", {"task": first_line, "round": 2})[1] == codex
     monkeypatch.setenv("EVOSIGHT_RESEARCH_BACKEND", "codex")
-    assert worker.call_recorded(job, "source_scout", {"task": other_line, "round": 2})[1] == dsh
+    assert worker.call_recorded(job, "plan", {"task": other_line, "round": 2})[1] == dsh
+
+
+def test_source_scout_creates_its_own_session_for_an_existing_codex_event(tmp_path, monkeypatch):
+    store = db.Store(tmp_path)
+    monkeypatch.delenv("EVOSIGHT_RESEARCH_BACKEND", raising=False)
+    calls = []
+
+    def invoke(self, role, ctx, model, effort, directory, thread_id, archive=()):
+        calls.append((role, model, directory, thread_id))
+        if role == "plan":
+            result, native = agents.Plan(rationale="核对工作区", tasks=[]), "codex-main"
+        else:
+            result, native = agents.SourceScout(publisher_urls=[], queries=[]), "dsh-scout"
+        return result, (1, 1), native, model
+
+    monkeypatch.setattr(agents.Runner, "_invoke", invoke)
+    with store.connection(True) as c:
+        event = db.add_event(c, "待补入口", "核对公告原文", [], status="paused")
+        job = db.require(c, "jobs", db.enqueue(c, "collect", event=event))
+    worker = Worker(store, agents.Runner("test"))
+    worker.call_recorded(job, "plan", {"round": 1})
+    worker.call_recorded(job, "source_scout", {"round": 1})
+    with store.connection(True) as c:
+        c.execute("UPDATE settings SET value=? WHERE key='news_agent_backend'", (db.dump("codex"),))
+    worker = Worker(db.Store(tmp_path), agents.Runner("test"))
+    worker.call_recorded(job, "source_scout", {"round": 2})
+    worker.call_recorded(job, "plan", {"round": 2})
+    assert [call[1] for call in calls] == ["gpt-6.2-sol", "dashscope/kimi-k3.1-pro",
+                                          "dashscope/kimi-k3.1-pro", "gpt-6.2-sol"]
+    assert [call[3] for call in calls] == [None, None, "dsh-scout", "codex-main"]
+    assert calls[0][2] == calls[3][2] and calls[1][2] == calls[2][2] and calls[0][2] != calls[1][2]
