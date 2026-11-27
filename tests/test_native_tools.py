@@ -74,6 +74,31 @@ def test_native_permissions_and_files_are_per_turn(tmp_path, monkeypatch):
     assert fallback[fallback.index("shell_tool") - 1] == "--disable" and 'web_search="live"' in fallback
 
 
+def test_linux_npm_codex_only_grants_read_access_to_the_native_binary(tmp_path, monkeypatch):
+    package = tmp_path / "node_modules/@openai/codex"
+    launcher = package / "bin/codex.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.touch()
+    native = package / "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
+    native.parent.mkdir(parents=True)
+    native.touch()
+    native.chmod(0o755)
+    monkeypatch.setattr(agents.platform, "machine", lambda: "x86_64")
+    assert agents._linux_codex_binary(str(launcher)) == str(native.resolve())
+
+    lane, evidence = tmp_path / "lane", tmp_path / "evidence"
+    options = agent_tools.codex_options(lane, evidence, False, executable=native)
+    config = tomllib.loads("\n".join(options[i + 1] for i, arg in enumerate(options) if arg == "-c"))
+    policy = config["permissions"]["evosight"]
+    assert policy["filesystem"] == {
+        ":minimal": "read",
+        str(lane.resolve()): "read",
+        str(evidence.resolve()): "read",
+        str(native.resolve()): "read",
+    }
+    assert policy["network"] == {"enabled": False}
+
+
 @pytest.mark.parametrize("time_scope", ["window", "history"])
 def test_news_prompt_uses_saved_round_window_when_resuming(tmp_path, monkeypatch, time_scope):
     monkeypatch.delenv("EVOSIGHT_CODEX_SEARCH", raising=False)

@@ -119,10 +119,14 @@ def scoped_shell(executable):
             return False
 
 
-def codex_options(cwd: Path, materials: Path, web: bool, shell=True):
+def codex_options(cwd: Path, materials: Path, web: bool, shell=True, *, executable=None):
     # The built-in read-only preset grants machine-wide reads. Name the two research
     # directories explicitly so a resumed session cannot inherit another turn's files.
     paths = [":minimal", str(cwd.resolve()), str(materials.resolve())]
+    if shell and executable:
+        binary = Path(executable).resolve()
+        if binary.is_file():
+            paths.append(str(binary))
     filesystem = ",".join(json.dumps(path, ensure_ascii=False) + '="read"' for path in paths)
     options = [
         "--enable" if shell else "--disable",

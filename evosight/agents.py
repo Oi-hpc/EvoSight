@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import signal
@@ -206,8 +207,8 @@ OFF = (
 
 
 def executable_codex():
-    if os.environ.get("EVOSIGHT_CODEX_CLI"):
-        return os.environ["EVOSIGHT_CODEX_CLI"]
+    if executable := os.environ.get("EVOSIGHT_CODEX_CLI"):
+        return _linux_codex_binary(executable) if sys.platform == "linux" else executable
     if os.name == "nt":
         native = shutil.which("codex.exe")
         if native:
@@ -220,7 +221,24 @@ def executable_codex():
     exe = shutil.which("codex.exe" if os.name == "nt" else "codex")
     if not exe:
         raise RuntimeError("缺少 Codex CLI，请设置 EVOSIGHT_CODEX_CLI")
-    return exe
+    return _linux_codex_binary(exe) if sys.platform == "linux" else exe
+
+
+def _linux_codex_binary(executable):
+    # The npm launcher runs a native binary whose exact path the sandbox needs to see.
+    launcher = Path(shutil.which(executable) or executable).resolve()
+    machine = platform.machine()
+    arch = {"x86_64": "x64", "aarch64": "arm64"}.get(machine)
+    if launcher.name != "codex.js" or not arch:
+        return executable
+    root = launcher.parent.parent
+    package = f"codex-linux-{arch}"
+    target = f"{machine}-unknown-linux-musl"
+    for vendor in (root / "node_modules/@openai" / package, root.parent / package, root):
+        binary = vendor / "vendor" / target / "bin/codex"
+        if binary.is_file() and os.access(binary, os.X_OK):
+            return str(binary.resolve())
+    return executable
 
 
 def dsh_command():
@@ -543,7 +561,11 @@ class Runner:
                             prop.pop("default", None)
                 schema_path.write_text(dump(spec), encoding="utf-8")
                 cmd = [executable, "-p", "kprsi", "-a", "never"]
-                cmd.extend(agent_tools.codex_options(cwd, materials, native_web, shell))
+                cmd.extend(
+                    agent_tools.codex_options(
+                        cwd, materials, native_web, shell, executable=executable if sys.platform == "linux" else None
+                    )
+                )
                 codex_dir = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
                 servers = {}
                 for f in (codex_dir / "config.toml", codex_dir / "kprsi.config.toml"):
