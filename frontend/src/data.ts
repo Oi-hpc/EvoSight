@@ -49,6 +49,7 @@ export interface Card {
   demo: number
   cadence: number
   unread: number
+  pending_questions: number
   upper: number
   token: string
   seen: number

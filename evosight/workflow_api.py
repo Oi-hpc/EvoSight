@@ -93,6 +93,12 @@ class RecordRead(BaseModel):
 
 
 def register_workflow_api(app, store):
+    from . import steering
+    steering.register(app, store)
+
+    from . import skills
+    skills.register(app, store)
+
     @app.post("/api/world/{entry}/disposition")
     def disposition(entry: int, data: Disposition):
         with store.connection(True) as c:

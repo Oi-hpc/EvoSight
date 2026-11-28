@@ -36,6 +36,24 @@ ARCHIVE_TOOL = {
 }
 
 
+SKILL_TOOL = {
+    "name": "read_research_skill",
+    "description": "读取本轮目录中已由用户确认的调查方法及其验收步骤。",
+    "inputSchema": {"type": "object", "properties": {"id": {"type": "integer", "minimum": 1}},
+                    "required": ["id"], "additionalProperties": False},
+    "annotations": {"readOnlyHint": True, "openWorldHint": False},
+}
+
+
+def skill_result(params, skills):
+    args = params.get("arguments")
+    ident = args.get("id") if isinstance(args, dict) else None
+    method = next((item for item in skills if type(ident) is int and item["id"] == ident), None)
+    if not method:
+        return {"content": [{"type": "text", "text": "该方法不在本轮已确认目录内。"}], "isError": True}
+    return {"content": [{"type": "text", "text": json.dumps(method, ensure_ascii=False)}]}
+
+
 def archive_result(params, archive):
     args = params.get("arguments")
     args = args if isinstance(args, dict) else {}
@@ -86,8 +104,8 @@ def search_result(params):
     return {"content": [{"type": "text", "text": json.dumps(list(results.values()), ensure_ascii=False)}]}
 
 
-def serve(stdin, stdout, *, web=True, archive=()):
-    available = ([TOOL] if web else []) + ([ARCHIVE_TOOL] if archive else [])
+def serve(stdin, stdout, *, web=True, archive=(), skills=()):
+    available = ([TOOL] if web else []) + ([ARCHIVE_TOOL] if archive else []) + ([SKILL_TOOL] if skills else [])
     remaining = 4
     for line in stdin:
         try:
@@ -119,6 +137,8 @@ def serve(stdin, stdout, *, web=True, archive=()):
                 reply["result"] = {"content": [{"type": "text", "text": "本次调用的公开搜索次数已用完。"}], "isError": True}
         elif method == "tools/call" and archive and params.get("name") == ARCHIVE_TOOL["name"]:
             reply["result"] = archive_result(params, archive)
+        elif method == "tools/call" and skills and params.get("name") == SKILL_TOOL["name"]:
+            reply["result"] = skill_result(params, skills)
         else:
             reply["error"] = {"code": -32601, "message": "Method or tool not found"}
         print(json.dumps(reply), file=stdout, flush=True)
@@ -128,6 +148,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive-file", type=Path)
     parser.add_argument("--archive-only", action="store_true")
+    parser.add_argument("--skills-file", type=Path)
     options = parser.parse_args()
     archive = json.loads(options.archive_file.read_text(encoding="utf-8")) if options.archive_file else ()
-    serve(sys.stdin.buffer, sys.stdout, web=not options.archive_only, archive=archive)
+    skills = json.loads(options.skills_file.read_text(encoding="utf-8")) if options.skills_file else ()
+    serve(sys.stdin.buffer, sys.stdout, web=not options.archive_only, archive=archive, skills=skills)

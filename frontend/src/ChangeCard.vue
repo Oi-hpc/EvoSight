@@ -30,6 +30,9 @@ defineEmits<{ read: [card: Card] }>()
       <a :href="'#/events/' + card.id">{{ card.title }}</a>
     </h3>
     <p class="scope">{{ card.scope }}</p>
+    <a v-if="card.pending_questions" class="evidence-link" :href="'#/events/' + card.id + '/research'">
+      {{ card.pending_questions }} 条 Agent 提问待你回答<ArrowUpRight />
+    </a>
     <div v-if="card.fact" class="change-row">
       <span class="row-label"><FileText />新增事实</span
       ><span class="row-content clamp">{{ card.fact.title }}</span>

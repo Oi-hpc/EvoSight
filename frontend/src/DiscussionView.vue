@@ -11,6 +11,7 @@ import {
   Target,
 } from 'lucide-vue-next'
 import { api, label, stamp, type CollectionFocus } from './data'
+import ResearchInbox from './ResearchInbox.vue'
 
 interface Citation {
   key: string
@@ -69,7 +70,7 @@ interface Conversation {
   turns: Turn[]
   has_older: boolean
 }
-const props = defineProps<{ eventId: number; revisionId: number; latest: boolean; demo: boolean }>()
+const props = defineProps<{ eventId: number; revisionId: number; latest: boolean; demo: boolean; researchReadOnly?: boolean }>()
 const basis = props.latest ? 'latest' : 'original'
 const base = props.eventId ? '/events/' + props.eventId + '/discussion' : '/agent/discussion'
 const query = '?basis=' + basis + (props.revisionId ? '&revision=' + props.revisionId : '')
@@ -100,6 +101,9 @@ const busy = computed(() =>
   )
 )
 const anchor = computed(() => state.value?.anchor)
+const canSteer = computed(() => !!props.eventId && !props.revisionId && !props.demo)
+const mode = ref<'chat' | 'investigation'>('chat')
+const pendingQuestions = ref(0)
 const switchingBackend = computed(
   () =>
     state.value?.session_provider &&
@@ -307,6 +311,13 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </header>
+      <div v-if="canSteer" class="discussion-modes" role="group" aria-label="沟通方式">
+        <button type="button" :aria-pressed="mode === 'chat'" @click="mode = 'chat'">与主 Agent 讨论</button>
+        <button type="button" :aria-pressed="mode === 'investigation'" @click="mode = 'investigation'">
+          调查要求与提问<span v-if="pendingQuestions"> · {{ pendingQuestions }} 待答</span>
+        </button>
+      </div>
+      <ResearchInbox v-if="canSteer" v-show="mode === 'investigation'" :event-id="eventId" :read-only="researchReadOnly" compact @pending="pendingQuestions = $event" />
       <details v-if="anchor?.run_id" class="discussion-archive" @toggle="openArchive">
         <summary>查看原预测输入与登记理由</summary>
         <p v-if="archiveBusy" class="meta">正在读取原预测归档…</p>
@@ -321,6 +332,7 @@ onBeforeUnmount(() => {
         </template>
       </details>
       <div
+        v-show="mode === 'chat'"
         ref="conversationLog"
         class="discussion-log"
         role="region"
@@ -451,7 +463,7 @@ onBeforeUnmount(() => {
           </div>
         </article>
       </div>
-      <form class="discussion-compose" @submit.prevent="send">
+      <form v-show="mode === 'chat'" class="discussion-compose" @submit.prevent="send">
         <div class="discussion-compose-heading">
           <label for="discussion-question">向{{ eventId ? '事件' : '工作台' }}主 Agent 提问</label>
           <label class="discussion-provider"
@@ -493,6 +505,7 @@ onBeforeUnmount(() => {
               ? '更换后端只能带入已保存的问答和材料，建议沿用当前会话。'
               : '讨论中的概率推演单独保存在对话里。'
           }}</span>
+          <button v-if="busy && canSteer && !researchReadOnly" type="button" class="btn quiet" @click="mode = 'investigation'">现在补充调查要求</button>
         </small>
       </form>
     </template>
@@ -560,6 +573,10 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 6px 12px;
 }
+.discussion-modes { display: flex; gap: 4px; margin-block: 0 8px; flex-wrap: wrap; }
+.discussion-modes button { padding: 5px 11px; font: inherit; font-size: .9rem; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); color: var(--sub); }
+.discussion-modes button[aria-pressed='true'] { background: var(--mint); border-color: var(--teal); color: var(--teal-deep); font-weight: 650; }
+.discussion-modes span { font-weight: 650; }
 .discussion-head h2,
 .discussion-start h3,
 .discussion-question p {

@@ -135,6 +135,7 @@ class Store:
             initial.execute("PRAGMA foreign_keys=OFF")
             initial.executescript(SCHEMA)
             initial.executescript(Path(__file__).with_name("workflow.sql").read_text(encoding="utf-8"))
+            initial.executescript(Path(__file__).with_name("skills.sql").read_text(encoding="utf-8"))
             allow_event_title_reuse(initial)
             from .discussion import allow_workspace_turns
 

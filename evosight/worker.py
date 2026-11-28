@@ -20,6 +20,7 @@ from . import (
     research,
     resources,
     scenarios,
+    skills,
     wakes,
     watch,
     workflow,
@@ -453,15 +454,19 @@ class Worker:
         return self.runner.profile(role)
 
     def call_recorded(self, job, role, ctx):
-        if job.get("event_id") and "demo" not in ctx:
+        if job.get("event_id"):
             with self.store.connection() as c:
                 if require(c, "events", job["event_id"])["demo"]:
                     ctx = {**ctx, "demo": True}
+                elif not (agent_tools.frozen(role, ctx) or ctx.get("replay") or ctx.get("demo")):
+                    methods = skills.applicable(c, job["event_id"], role)
+                    if methods:
+                        ctx = {**ctx, "approved_skill_versions": methods}
         lane = None
         old_lane = None
         recipient = "主 Agent"
         event_key = job.get("event_id") or "workspace"
-        if not agent_tools.frozen(role, ctx):
+        if not agent_tools.frozen(role, ctx) and role != "skill_draft":
             task = ctx.get("task")
             if task:
                 line = task.get("line") or task.get("target") or task["question"]
@@ -735,6 +740,8 @@ class Worker:
                     (rid, job["id"]),
                 )
                 return self.receipt(c, job, f"定时采集已进入轮次 #{rid}")
+        if job["kind"] == "skill_draft":
+            return skills.generate(self, job, args["skill_id"])
         with self.store.connection() as c:
             if event:
                 e = require(c, "events", event)
@@ -1139,6 +1146,7 @@ class Worker:
                     model,
                     observed_level=verdict.observed_level if outcome == "level" else None,
                     observed_at=verdict.observed_at,
+                    proposed_method=verdict.method,
                 )
                 self.checked(
                     c, ident, snap_id, gate_ids, "checking" if outcome == "conflict" else "settled", reason

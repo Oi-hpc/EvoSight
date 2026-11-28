@@ -42,7 +42,7 @@ def recipient_at(c, r, key):
 
 
 def post(c, r, source_task_id, recipient_line_key, question, body, document_ids, *,
-         review_key=None, frozen_ids=None):
+         review_key=None, frozen_ids=None, user_input=None):
     """Save the board note and durable delivery intent in the caller's transaction."""
     event, goal = r["event_id"], r["goal_version"]
     docs = sorted(permitted_documents(c, r, document_ids))
@@ -52,21 +52,22 @@ def post(c, r, source_task_id, recipient_line_key, question, body, document_ids,
     line = recipient_at(c, r, recipient_line_key)
     key = workflow.fingerprint(
         event, goal, r["id"], recipient_line_key, "review" if review_key is not None else "handoff",
-        review_key if review_key is not None else (docs, fragment_ids, body),
+        ("user_input", user_input) if user_input is not None else
+        (review_key if review_key is not None else (docs, fragment_ids, body)),
     )
     prior = one(c, "SELECT note_id FROM investigation_wake_notes WHERE delivery_key=?", (key,))
     if prior:
         return prior["note_id"]
     ident = board.note(
         c, event, goal, question, recipient_line_key, body, "handoff",
-        "独立复核退回原调查线" if review_key is not None else "侦查员交接",
+        "用户调查要求" if user_input is not None else ("独立复核退回原调查线" if review_key is not None else "侦查员交接"),
         [], rid=r["id"], task=source_task_id, documents=docs,
-        handoff_version=key if line and fragment_ids else None,
+        handoff_version=key if line and (fragment_ids or user_input) else None,
     )
     c.execute("INSERT OR IGNORE INTO handoff_inbox(note_id,documents) VALUES(?,?)", (ident, dump(docs)))
     if one(c, "SELECT 1 FROM investigation_wake_notes WHERE note_id=?", (ident,)):
         return ident
-    if not line or not fragment_ids or not workflow.goal_matches(c, r):
+    if not line or not (fragment_ids or user_input) or not workflow.goal_matches(c, r):
         return ident
     if source_task_id == line["last_task"] and review_key is None:
         return ident
@@ -122,7 +123,9 @@ def run(worker, job):
                 message["fragment_ids"] = [f["id"] for f in frozen_fragments(c, json.loads(message["fragment_ids"]))
                                            if f["document_id"] in allowed]
             inputs = list(dict.fromkeys(d for m in messages for d in m["documents"]))
-            if not inputs:
+            user_instruction = one(c, """SELECT 1 FROM research_inputs i JOIN investigation_wake_notes n
+                                       ON n.note_id=i.wake_note WHERE n.job_id=?""", (job["id"],))
+            if not inputs and not user_instruction:
                 return stop_job(c, job["id"], "交接已无可用于本轮的原文")
             ctx = json.loads(r["context"]) if r["context"] else research.study_context(c, r)
             ctx.update({
@@ -223,15 +226,20 @@ def forward_to_latest(c, r):
         return "目标已更新，旧窗口交接已停止"
     stopped = False
     for message in messages:
+        instruction = one(c, "SELECT id FROM research_inputs WHERE wake_note=?", (message["id"],))
         target = post(c, active, None, message["subject"], message["question"], message["body"],
                       json.loads(message["documents"]), frozen_ids=json.loads(message["fragment_ids"]),
-                      review_key=(f"forward/{message['id']}" if message["reason"] == "独立复核退回原调查线" else None))
+                      review_key=(f"forward/{message['id']}" if message["reason"] == "独立复核退回原调查线" else None),
+                      user_input=instruction["id"] if instruction else None)
         if not one(c, "SELECT 1 FROM investigation_wake_notes WHERE note_id=?", (target,)):
             c.execute("INSERT OR IGNORE INTO investigation_wake_stops VALUES(?,?)",
                       (message["id"], "新窗口没有可接收这份原文的调查线，交接已停止"))
             stopped = True
             continue
         c.execute("UPDATE investigation_wake_notes SET forwarded_to=? WHERE note_id=?", (target, message["id"]))
+        if instruction:
+            c.execute("UPDATE research_inputs SET wake_note=?,round_id=?,received_task_id=NULL WHERE id=?",
+                      (target, active["id"], instruction["id"]))
         c.execute("""UPDATE tracking_rounds SET job_id=(SELECT job_id FROM investigation_wake_notes WHERE note_id=?)
                      WHERE id=? AND job_id IS NULL""", (target, active["id"]))
     return (f"已对照较新轮次 #{active['id']}；无法继续的交接已记录原因" if stopped

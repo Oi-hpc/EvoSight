@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timedelta
 
 from .db import dump, instant, node, one, require, rows, utc
-from . import scenarios, workflow
+from . import scenarios, skills, workflow
 
 
 def referenced(c, event, ids, required=True):
@@ -101,10 +101,11 @@ def revise(c, ident, p, reason, refs, model, *, at=None, outlook=None):
 
 
 def settle(
-    c, ident, outcome, public_at, reason, refs, lesson, actor, *, at=None, observed_level=None, observed_at=""
+    c, ident, outcome, public_at, reason, refs, lesson, actor, *, at=None, observed_level=None, observed_at="",
+    proposed_method=None, extract_lesson=False
 ):
     pred = require(c, "predictions", ident)
-    require(c, "events", pred["event_id"])
+    event = require(c, "events", pred["event_id"])
     when = instant(at) if at else utc()
     scale = scenarios.definition(c, ident)
     allowed_outcomes = ("level",) if scale else ("yes", "no")
@@ -219,6 +220,13 @@ def settle(
             resolution=resolution_id,
         )
         node(c, pred["event_id"], "retrospective", "预测复盘", lesson, refs=refs, prediction=ident, at=when)
+        if (proposed_method is not None or extract_lesson) and not event["demo"]:
+            source = one(c, "SELECT id FROM observations WHERE resolution_id=? AND origin='待验证经验'",
+                         (resolution_id,))
+            if proposed_method is not None:
+                skills.from_verdict(c, event["id"], source["id"], proposed_method)
+            else:
+                skills.request(c, event["id"], source["id"])
     return scores
 
 

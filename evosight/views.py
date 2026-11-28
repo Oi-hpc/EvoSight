@@ -1,6 +1,6 @@
 import json
 
-from . import forecast
+from . import forecast, steering
 from .db import config, expand_node, one, read_token, require, rows, usage
 
 
@@ -84,6 +84,7 @@ def card(c, e):
     return {
         **e,
         **counts,
+        "pending_questions": steering.question_count(c, event) if e["status"] == "active" and not e["demo"] else 0,
         "seen": seen,
         "token": read_token(c, event, upper),
         "fact": latest("fact"),

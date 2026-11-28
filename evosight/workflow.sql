@@ -389,6 +389,14 @@ CREATE TABLE IF NOT EXISTS delivery_answers (
     answer TEXT NOT NULL,citations TEXT NOT NULL,
     PRIMARY KEY(snapshot_id,position), FOREIGN KEY(snapshot_id,position) REFERENCES snapshot_checklist
 );
+CREATE TABLE IF NOT EXISTS research_input_reports (
+    input_id INTEGER NOT NULL REFERENCES research_inputs(id),
+    snapshot_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY(input_id,snapshot_id),
+    UNIQUE(snapshot_id,position),
+    FOREIGN KEY(snapshot_id,position) REFERENCES snapshot_checklist(snapshot_id,position)
+);
 CREATE TABLE IF NOT EXISTS card_provenance (
     version_id INTEGER PRIMARY KEY REFERENCES claims, fields TEXT NOT NULL, evidence TEXT NOT NULL
 );
@@ -405,4 +413,20 @@ CREATE TABLE IF NOT EXISTS task_rejections (
 CREATE TABLE IF NOT EXISTS snapshot_rejections (
     snapshot_id INTEGER NOT NULL REFERENCES knowledge_snapshots,task_id INTEGER NOT NULL REFERENCES research_tasks,
     subject TEXT NOT NULL,reason TEXT NOT NULL, PRIMARY KEY(snapshot_id,task_id,subject,reason)
+);
+CREATE TABLE IF NOT EXISTS research_inputs (
+    id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL REFERENCES events, goal_version INTEGER NOT NULL,
+    origin_round_id INTEGER NOT NULL REFERENCES tracking_rounds, round_id INTEGER NOT NULL REFERENCES tracking_rounds,
+    kind TEXT NOT NULL CHECK(kind IN ('requirement','question')), text TEXT NOT NULL, answer TEXT,
+    line_key TEXT NOT NULL DEFAULT '', role TEXT NOT NULL DEFAULT 'main',
+    target_task_id INTEGER REFERENCES research_tasks, received_task_id INTEGER REFERENCES research_tasks,
+    wake_note INTEGER REFERENCES event_notes, main_received INTEGER NOT NULL DEFAULT 0,
+    nonce TEXT, answer_nonce TEXT, submission TEXT, created_at TEXT NOT NULL,
+    UNIQUE(event_id,nonce)
+);
+CREATE INDEX IF NOT EXISTS research_input_round ON research_inputs(round_id,id);
+CREATE INDEX IF NOT EXISTS research_open_questions ON research_inputs(event_id,goal_version,id)
+    WHERE kind='question' AND answer IS NULL;
+CREATE TABLE IF NOT EXISTS research_synthesis_started (
+    round_id INTEGER PRIMARY KEY REFERENCES tracking_rounds
 );

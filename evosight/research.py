@@ -18,6 +18,8 @@ from . import (
     materials,
     people,
     resources,
+    steering,
+    steering_reports,
     wakes,
     watch,
     workflow,
@@ -94,7 +96,7 @@ def publish_interim(c, r):
             if not quote or (ref.fragment_id, quote) in seen:
                 continue
             excerpts.append({
-                "question": task["question"], "quote": quote, "fragment_id": ref.fragment_id,
+                "task_id": task["id"], "question": task["question"], "quote": quote, "fragment_id": ref.fragment_id,
                 "document_id": f["document_id"], "locator": f["locator"], "title": f["title"],
                 "in_event": bool(f["in_event"]), "url": f["url"] if f["url"].startswith(("https://", "http://")) else "",
             })
@@ -831,6 +833,7 @@ def acquire(worker, r, job):
         if not ids and (
             not r["parent_snapshot"]
             or due
+            or steering.pending(c, r["id"])
             or any(x in reasons for x in ("目标更新", "恢复追踪", "专项补查", "人物专项", "用户订正"))
         ):
             ids = [
@@ -974,6 +977,7 @@ def prepare_task(worker, r, t, assignment, context, ids):
 
 
 def save_plan(c, r, plan):
+    steering.complete_assignments(c, r, plan)
     board.save_guides(c, r, plan.model_dump())
     c.execute(
         "UPDATE tracking_rounds SET plan=?,state='researching' WHERE id=?", (dump(plan.model_dump()), r["id"])
@@ -1016,6 +1020,8 @@ def save_plan(c, r, plan):
                 tid,
             ),
         )
+    steering.bind_plan(c, r, plan)
+    steering.ask(c, r, "main", "", plan.user_question)
 
 
 def validated_links(proposals, available):
@@ -1098,7 +1104,7 @@ def run_role(worker, job, r, plan, ctx, ids, t):
         history = []
         for step in range(3):
             role_context["archive_fragment_ids"] = [f["id"] for f in frags]
-            with worker.store.connection() as c:
+            with worker.store.connection(True) as c:
                 previous = one(
                     c,
                     "SELECT request,result FROM research_tool_steps WHERE task_id=? AND step=?",
@@ -1106,6 +1112,9 @@ def run_role(worker, job, r, plan, ctx, ids, t):
                 )
                 if job["kind"] != "investigation_wake":
                     role_context["事件黑板"] = board.view(c, r["event_id"], r["goal_version"])
+                assigned = steering.receive(c, r, t["id"], job["id"])
+                if assigned:
+                    role_context["用户调查要求"] = assigned
             if previous:
                 request, response = json.loads(previous["request"]), json.loads(previous["result"])
             else:
@@ -1121,6 +1130,10 @@ def run_role(worker, job, r, plan, ctx, ids, t):
                         "fragments": model_fragments(frags),
                     },
                 )
+                if result.user_question.strip():
+                    line = assignment.get("line") or f"{t['role']}/{t['target'] or assignment['question']}"
+                    with worker.store.connection(True) as c:
+                        steering.ask(c, r, t["role"], line, result.user_question)
                 if step == 2 and result.lookup:
                     pending = f"本轮工具额度已用完，留待下次查证“{result.lookup.query}”。"
                     if len(result.gaps) < 8:
@@ -1284,6 +1297,8 @@ def run_round(worker, job, rid, candidates):
         if r["state"] in ("published", "unchanged", "superseded"):
             if not retry_positions and not (job["kind"] == "handoff_publish" and wakes.unpublished(c, rid)):
                 return r["detail"]
+        elif job["kind"] != "handoff_publish" and "补采缺失窗口" not in json.loads(r["reasons"]):
+            steering.recover_unread(c, r)
     ids = json.loads(r["input_docs"]) if r["input_docs"] is not None else acquire(worker, r, job)
     if not ids:
         with worker.store.connection() as c:
@@ -1302,6 +1317,8 @@ def run_round(worker, job, rid, candidates):
             c.execute("UPDATE tracking_rounds SET context=? WHERE id=?", (dump(ctx), rid))
         fragments = materials.fragments_for(c, ids)
     if not r["plan"]:
+        with worker.store.connection() as c:
+            inputs = steering.for_plan(c, r)
         lead_fragments = people.lead_fragments(
             fragments, [s["target"] for s in ctx.get("collection_scope", []) if s["kind"] == "person"]
         )
@@ -1313,6 +1330,7 @@ def run_round(worker, job, rid, candidates):
                 "evidence": [{"id": d["id"], "title": d["title"]} for d in docs],
                 "fragments": model_fragments(fragments)[:12],
                 "people_evidence": lead_fragments,
+                **({"用户调查要求": inputs} if inputs else {}),
                 **({"上次校验反馈": job["info"]} if job.get("info", "").startswith("模型输出未通过结构校验") else {}),
             },
         )
@@ -1429,7 +1447,7 @@ def run_round(worker, job, rid, candidates):
                 error = future.result()
                 budget_error = budget_error or error
     drain_wakes(worker, r, deadline)
-    with worker.store.connection() as c:
+    with worker.store.connection(True) as c:
         tasks = rows(c, "SELECT * FROM research_tasks WHERE round_id=? ORDER BY id", (rid,))
         if not workflow.goal_matches(c, r):
             return "研究目标已更新"
@@ -1478,7 +1496,15 @@ def run_round(worker, job, rid, candidates):
         )
         research_docs = list(dict.fromkeys([*[d["id"] for d in docs], *prior_sources]))
         review_fragments = wakes.publication_fragments(c, r, research_docs)
+        plan, user_requests = steering_reports.checklist(plan, steering.for_synthesis(c, r))
         review = delivery.review_inputs(c, r, plan, review_fragments, earlier, reports)
+        if user_requests:
+            review["用户补充与答复"] = user_requests
+            review["用户补充交付说明"] = (
+                "每条已接收的补充有固定的 check_id。逐项在 delivery 填写终稿答复；"
+                "用户提供的是调查范围、偏好或线索，确认事实仍须引用归档原文。"
+                "证据不足时填 unknown，写清缺哪项依据。若它改变了综合判断，请在 judgment 说明。"
+            )
         shown_ids = {f["id"] for f in review["交付可引用原文"]}
         review_archive = {f["id"]: f for f in review_fragments if f["id"] in shown_ids}
         # The author can cite the archived paragraphs carried from a prior snapshot as well.
@@ -1554,7 +1580,7 @@ def run_round(worker, job, rid, candidates):
         adjudicated.persist(c, r, job, raw_tasks)
         approved = delivery.reconcile_handoff_gaps(adjudicated.publish_tasks(tasks), original_tasks)
         detail = publish(c, r, approved, synthesis, refs, plan, docs, candidates,
-                         worker, job, checked=checked)
+                         worker, job, checked=checked, user_requests=user_requests)
         queue_failed_tasks(c, r, tasks, job["id"])
         return detail
 
@@ -1590,12 +1616,15 @@ def queue_failed_tasks(c, r, tasks, source_job):
         c.execute("UPDATE jobs SET retry_at=?,info=? WHERE id=?", (later(delay), "稍后自动补查失败的调查线", retry))
 
 
-def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job, *, checked=None):
+def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job, *, checked=None,
+            user_requests=()):
     event = r["event_id"]
     rid = r["id"]
     signature = workflow.fingerprint(
         [(t["id"], t["state"], t["result"]) for t in tasks], synthesis.model_dump(), checked
     )
+    if user_requests:
+        signature = workflow.fingerprint(signature, [(u["id"], u["check_id"]) for u in user_requests])
     existing = one(
         c, "SELECT snapshot_id FROM round_publications WHERE round_id=? AND signature=?", (rid, signature)
     )
@@ -1916,6 +1945,8 @@ def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job, *
     delivery.save(
         c, snap, checked if checked is not None else delivery.inspect(plan, synthesis.delivery, frags)
     )
+    if user_requests:
+        steering_reports.save(c, snap, user_requests)
     c.execute(
         """INSERT INTO snapshot_rejections SELECT ?,t.id,j.subject,j.reason FROM task_rejections j
                  JOIN research_tasks t ON t.id=j.task_id WHERE t.round_id=?""",

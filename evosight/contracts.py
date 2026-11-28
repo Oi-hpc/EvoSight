@@ -87,6 +87,7 @@ class Assignment(Record):
     knowledge_query: KnowledgeQuery | None = None
     line: str = Field(default="", max_length=120)
     review_checks: list[Annotated[int, Field(ge=1, le=16)]] = Field(default_factory=list, max_length=16)
+    request_ids: list[PositiveInt] = Field(default_factory=list, max_length=32)
 
 
 class Monitor(Record):
@@ -119,6 +120,7 @@ class PersonLead(Record):
 
 class Plan(Record):
     rationale: str = Field(max_length=1200)
+    user_question: str = Field(default="", max_length=600)
     tasks: list[Assignment] = Field(max_length=8)
     postponed: list[str] = Field(default_factory=list, max_length=10)
     watch: list[Monitor] = Field(default_factory=list, max_length=6)
@@ -309,6 +311,7 @@ class ResolvedGap(Record):
 
 
 class Report(Record):
+    user_question: str = Field(default="", max_length=600)
     findings: list[Finding] = Field(default_factory=list, max_length=8)
     use_knowledge: list[KnowledgeLink] = Field(default_factory=list, max_length=4)
     gaps: list[str] = Field(default_factory=list, max_length=8)
@@ -319,6 +322,8 @@ class Report(Record):
 
 
 PLANNER = (
+    "用户调查要求中的 id 表示本轮指令或用户澄清，不是事实证据。按问题分派给调查任务，在 tasks[].request_ids 中填所负责的用户要求编号。"
+    "仅在用户的范围、偏好或判断标准确实影响交付且无法从材料获知时，在 user_question 中向用户提出一个具体问题；继续其他可做工作。"
     "checklist 按用户原始研究目标列出逐项可独立验收的问题，一项只核查一件事。"
     "即使已有结论，也保留仍属本轮范围的核查点。取证任务的数量不限制交付清单的项数。"
     "对会改变用户决策或预测、容易混淆适用范围或有相反材料的关键项，在负责取证的那条任务的 review_checks 填 checklist 的序号（从1开始）。"
@@ -350,6 +355,8 @@ ROLE_INSTRUCTIONS["people"] += (
     "变化、可能影响及未知之处。心理或动机解释列为假设，须给替代解释和反证条件。"
 )
 RESEARCH = (
+    "用户调查要求是研究指令、范围或澄清，不能作为事实证据。给每项要求查证并反馈结论或还缺的证据。"
+    "需要用户澄清范围、偏好或口径时，在 user_question 中写一个具体可回答的问题；可一边查其他材料，无需停工。"
     "接到交接补查时，如果本次直接原文已经回答了上次调查结果中的某条 gaps，在 resolved_gaps 逐字填那条 gap，"
     "并填本次事实或订正实际引用的 fragment_id。只补了一部分时，在本次 gaps 写清剩余问题。其他情况填空数组。"
     "资料卡的发布方由系统读取归档元数据。其他字段由你提议，逐项给 field_citations。"

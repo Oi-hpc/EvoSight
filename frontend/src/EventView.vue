@@ -425,6 +425,7 @@ const tabList = [
       :event-id="eventId"
       :revision-id="selected"
       :latest="!selected || through === 1"
+      :research-read-only="d.card.status !== 'active'"
       :demo="!!d.card.demo"
     />
     <KnowledgeView
@@ -434,6 +435,7 @@ const tabList = [
       :mode="active"
       :selected="selected"
       :round-id="active === 'research' ? through : 0"
+      :delivery-item="active === 'knowledge' ? through : 0"
       :demo="!!d.card.demo"
       @changed="knowledgeChanged"
     />

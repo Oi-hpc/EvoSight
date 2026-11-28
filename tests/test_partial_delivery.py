@@ -43,6 +43,9 @@ def test_waiting_round_delivers_immutable_excerpt_before_slow_role_returns(tmp_p
                 assert not workflow.latest(c, event["id"])
                 assert not db.one(c, "SELECT id FROM jobs WHERE kind='forecast'")
                 ref = preview["excerpts"][0]
+                assert ref["task_id"] == db.one(c, "SELECT id FROM research_tasks WHERE round_id=? AND role='news'",
+                                                (event["round"],))["id"]
+                assert ref["line_key"].startswith("news/")
                 assert ref["in_event"] and ref["quote"] in db.require(c, "fragments", ref["fragment_id"])["text"]
         finally:
             release.set()

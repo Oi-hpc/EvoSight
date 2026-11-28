@@ -388,6 +388,7 @@ def make_app(store: Store, runner=None, *, background=True, acquisition=None):
                 data.refs,
                 data.lesson,
                 "人工裁定",
+                extract_lesson=True,
                 observed_level=data.observed_level,
                 observed_at=data.observed_at,
             )

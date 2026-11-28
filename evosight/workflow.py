@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 
@@ -400,16 +401,40 @@ def list_rounds(c, event, rid=None):
         r["evidence_preview"] = preview
         r["tasks"] = rows(
             c,
-            "SELECT id,role,question,target,time_scope,done_when,priority,state,detail FROM research_tasks WHERE round_id=? ORDER BY priority DESC,id",
-            (r["id"],),
+            """SELECT t.id,t.role,t.question,t.target,t.time_scope,t.done_when,t.priority,t.state,t.detail,
+                      l.line_key FROM research_tasks t
+               LEFT JOIN investigation_wakes w ON w.task_id=t.id
+               LEFT JOIN investigation_lines l ON l.id=w.line_id AND l.event_id=?
+               WHERE t.round_id=? ORDER BY t.priority DESC,t.id""",
+            (event, r["id"]),
         )
+        owners = defaultdict(set)
+        for a in (r["plan"] or {}).get("tasks", []):
+            key = (a["role"], a["question"])
+            owners[key].add(a.get("line") or f"{a['role']}/{a.get('target') or a['question']}")
         for t in r["tasks"]:
+            candidates = owners[t["role"], t["question"]]
+            if not t["line_key"]:
+                t["line_key"] = next(iter(candidates)) if len(candidates) == 1 else ""
             t["role_name"] = ROLE_NAMES[t["role"]]
             t["rejections"] = rows(
                 c,
                 "SELECT subject,reason FROM task_rejections WHERE task_id=? ORDER BY subject,reason",
                 (t["id"],),
             )
+        if preview:
+            by_id = {t["id"]: t for t in r["tasks"]}
+            by_question = defaultdict(list)
+            for t in r["tasks"]:
+                by_question[t["question"]].append(t)
+            for excerpt in preview["excerpts"]:
+                task = by_id.get(excerpt.get("task_id"))
+                if "task_id" not in excerpt:
+                    # Old previews stored only the question. It may belong to two investigators.
+                    matches = by_question[excerpt["question"]]
+                    task = matches[0] if len(matches) == 1 else None
+                excerpt["task_id"] = task["id"] if task else None
+                excerpt["line_key"] = task["line_key"] if task else ""
         r["coverage"] = rows(
             c,
             "SELECT url,state,window_start,window_end,checked_at,recovery_round FROM round_sources WHERE round_id=?",

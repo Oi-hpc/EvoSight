@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { BookOpen, FileText, History, Search, Settings2 } from 'lucide-vue-next'
 import { api, host, knowledgeKind, label, stamp, type CollectionFocus, type Home } from './data'
+import ResearchInbox from './ResearchInbox.vue'
+import ResearchSkills from './ResearchSkills.vue'
 type Cite = {
   fragment_id: number
   document_id: number
@@ -101,6 +103,7 @@ type Knowledge = {
   closure: { id: number; reason: string } | null
 }
 type Task = {
+  line_key?: string | null
   rejections?: { subject: string; reason: string }[]
   id: number
   role_name: string
@@ -121,6 +124,8 @@ type Round = {
   evidence_preview?: {
     published_at: string
     excerpts: {
+      line_key?: string | null
+      task_id?: number | null
       question: string
       quote: string
       fragment_id: number
@@ -154,9 +159,12 @@ const props = defineProps<{
   mode: string
   selected: number
   roundId: number
+  deliveryItem: number
   demo: boolean
 }>()
 const emit = defineEmits<{ changed: [] }>()
+const inbox = ref<InstanceType<typeof ResearchInbox>>()
+const skillPanel = ref<InstanceType<typeof ResearchSkills>>()
 const data = ref<Knowledge>(),
   rounds = ref<Round[]>([]),
   collection = ref<CollectionFocus[]>([]),
@@ -273,6 +281,16 @@ watch(
   load,
   {
     immediate: true,
+  }
+)
+watch(
+  () => [props.mode, props.deliveryItem, props.selected, data.value?.snapshot, data.value?.delivery_snapshot],
+  async () => {
+    if (props.mode !== 'knowledge' || !props.deliveryItem || data.value?.snapshot !== props.selected ||
+        !data.value?.delivery?.some(i => i.position === props.deliveryItem)) return
+    section.value = 'background'
+    await nextTick()
+    document.getElementById('delivery-' + props.deliveryItem)?.scrollIntoView({ block: 'center' })
   }
 )
 onMounted(() => {
@@ -420,7 +438,8 @@ const deliveryLabels = { confirmed: '已写入', unknown: '已写明证据缺口
           <section v-if="section === 'background' && data.delivery?.length" aria-label="交付核对">
             <h3>交付核对</h3>
             <p v-if="data.delivery_snapshot !== data.snapshot" class="meta">最近一次研究报告来自版本 #{{ data.delivery_snapshot }}。</p>
-            <article v-for="item in data.delivery" :key="item.position" class="rail-item">
+            <article v-for="item in data.delivery" :key="item.position" :id="'delivery-' + item.position"
+              class="rail-item" :class="{ 'delivery-focus': deliveryItem === item.position && selected === data.snapshot }">
               <strong>{{ item.question }}</strong>
               <small> · {{ deliveryLabels[item.state] }}</small>
               <p v-if="item.answer || item.reason">{{ item.answer || item.reason }}</p>
@@ -597,6 +616,7 @@ const deliveryLabels = { confirmed: '已写入', unknown: '已写明证据缺口
     </div>
     <div v-else class="split">
       <div class="stack">
+        <ResearchInbox v-if="!demo" ref="inbox" :event-id="eventId" :read-only="data.event_status !== 'active'" />
         <section v-if="collection.length" class="panel">
           <header class="panel-head">
             <h2>持续收集范围</h2>
@@ -647,6 +667,8 @@ const deliveryLabels = { confirmed: '已写入', unknown: '已写明证据缺口
               }}
             </p>
             <p>{{ r.detail }}</p>
+            <button v-if="!demo && data.event_status === 'active' && data.goal.version === r.goal_version" class="btn quiet"
+              @click="inbox?.pointTo(r.id, r.goal_version)">就此轮补充要求</button>
             <details v-if="r.evidence_preview" :open="r.state === 'researching'" class="kb-task">
               <summary>阶段性材料 · {{ stamp(r.evidence_preview.published_at, true) }}</summary>
               <p v-for="(excerpt, n) in r.evidence_preview.excerpts" :key="n">
@@ -658,6 +680,8 @@ const deliveryLabels = { confirmed: '已写入', unknown: '已写明证据缺口
                 <a v-else-if="excerpt.url" :href="excerpt.url" target="_blank" rel="noopener noreferrer">
                   {{ excerpt.title }} · 发布方原文
                 </a>
+                <button v-if="!demo && data.event_status === 'active' && data.goal.version === r.goal_version" class="btn quiet"
+                  @click="inbox?.pointTo(r.id, r.goal_version, excerpt.line_key || r.tasks.find(t => t.id === excerpt.task_id)?.line_key || '', `请复核材料 #${excerpt.document_id} 的片段 #${excerpt.fragment_id}（${excerpt.title}）。`)">就这条材料补充</button>
               </p>
               <p class="meta">发布时待查</p>
               <ul>
@@ -709,6 +733,8 @@ const deliveryLabels = { confirmed: '已写入', unknown: '已写明证据缺口
                 {{ t.done_when }}</small
               >
               <p v-if="t.detail" class="meta">{{ t.detail }}</p>
+              <button v-if="!demo && data.event_status === 'active' && data.goal.version === r.goal_version" class="btn quiet"
+                @click="inbox?.pointTo(r.id, r.goal_version, t.line_key || '', '关于「' + t.question + '」：')">补充这项调查</button>
               <details v-if="t.rejections?.length">
                 <summary>本次调查曾退回的提议（{{ t.rejections.length }}）</summary>
                 <p v-for="row in t.rejections" :key="row.subject + row.reason">{{ row.subject }} · {{ row.reason }}</p>
@@ -838,6 +864,10 @@ const deliveryLabels = { confirmed: '已写入', unknown: '已写明证据缺口
               >来自 {{ l.title }} · {{ l.state === 'withdrawn' ? '已撤回' : '待独立验证' }}</small
             >
             <h3>{{ l.question }}</h3>
+            <button v-if="!demo && l.event_id === eventId && (l.state !== 'withdrawn' || skillPanel?.has(l.id))"
+              type="button" class="btn quiet" @click="skillPanel?.propose(l.id)">
+              {{ skillPanel?.has(l.id) ? '查看调查方法' : '提炼为候选方法' }}
+            </button>
             <p v-for="r in l.reviews" :key="r.event_id + '-' + r.reason">
               {{ outcomeLabel[r.outcome] }} · {{ r.reason }}
               <a :href="'#/events/' + r.event_id + '/doc/' + r.document_id">{{ r.title }}的证据</a>
@@ -892,6 +922,7 @@ const deliveryLabels = { confirmed: '已写入', unknown: '已写明证据缺口
             </form>
           </article>
         </section>
+        <ResearchSkills v-if="!demo" ref="skillPanel" :event-id="eventId" :lessons="data.lessons || []" />
       </aside>
     </div>
   </template>
@@ -1000,6 +1031,7 @@ blockquote p {
 summary {
   cursor: pointer;
 }
+.delivery-focus { border-left: 3px solid var(--teal); background: var(--mint); }
 .kb-entry small,
 .kb-task small {
   color: #576c68;

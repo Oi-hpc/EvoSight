@@ -17,7 +17,7 @@ def frozen(role, context):
 def live_web(role, context):
     # Publication and forecast registration sign a specific archive. Collection
     # and current conversations have a return path for newly discovered URLs.
-    return role not in ("study", "forecast") and not (
+    return role not in ("study", "forecast", "skill_draft") and not (
         frozen(role, context) or context.get("demo") or context.get("replay")
     )
 
