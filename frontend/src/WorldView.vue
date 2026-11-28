@@ -108,6 +108,7 @@ async function recordChange(dispute?: number) {
   finally { saving.value = false }
 }
 const available = computed(() => props.events.filter((e) => !e.demo))
+const eventIds = computed(() => new Set(props.events.map((e) => e.id)))
 const existingLink = computed(() => item.value?.events.find((link) => link.id === chosen.value))
 const route = (entry = 0, version = 0, path = props.catalogPath) =>
   '#/world/' +
@@ -357,7 +358,7 @@ onBeforeUnmount(() => {
           <strong>{{ item.field_labels[key] || key }}</strong>
           <p v-for="ref in proof" :key="ref.fragment_id + ref.locator">
             {{ ref.method === 'archive' ? '归档元数据' : '已核对的提议' }} · {{ ref.locator }} · {{ ref.quote }}
-            <a v-if="ref.document_id" :href="'#/events/' + item.claim.event_id + '/doc/' + ref.document_id + '/' + ref.fragment_id">查看片段 #{{ ref.fragment_id }}</a>
+            <a v-if="ref.document_id && eventIds.has(item.claim.event_id)" :href="'#/events/' + item.claim.event_id + '/doc/' + ref.document_id + '/' + ref.fragment_id">查看片段 #{{ ref.fragment_id }}</a>
           </p>
         </div>
       </details>
@@ -384,9 +385,11 @@ onBeforeUnmount(() => {
       <blockquote v-for="c in item.claim.citations" :key="c.fragment_id + ':' + c.quote">
         <p>{{ c.quote }}</p>
         <a
+          v-if="eventIds.has(item.claim.event_id)"
           :href="'#/events/' + item.claim.event_id + '/doc/' + c.document_id + '/' + c.fragment_id"
           >{{ c.title }}</a
         >
+        <template v-else>{{ c.title }}</template>
         · <a :href="c.link" target="_blank" rel="noopener noreferrer">{{ c.locator }}</a>
       </blockquote>
     </section>
@@ -458,7 +461,8 @@ onBeforeUnmount(() => {
       <h2>修订历史</h2>
       <p v-for="v in item.history" :key="v.id">
         <a :href="route(item.id, v.id)">版本 {{ v.version }}</a> · {{ stamp(v.created_at, true) }} ·
-        由 <a :href="'#/events/' + v.origin_id">{{ v.origin }}</a> 贡献
+        由 <a v-if="eventIds.has(v.origin_id)" :href="'#/events/' + v.origin_id">{{ v.origin }}</a>
+        <template v-else>{{ v.origin }}</template> 贡献
       </p>
     </section>
   </template>

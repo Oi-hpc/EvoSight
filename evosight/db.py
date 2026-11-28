@@ -50,7 +50,7 @@ def one(c, sql, args=()):
 
 def require(c, table, ident):
     record = one(c, "SELECT * FROM " + table + " WHERE id=?", (ident,))
-    if record is None:
+    if record is None or (table == "events" and record["status"] == "deleted"):
         raise KeyError("记录不存在")
     return record
 
@@ -58,7 +58,7 @@ def require(c, table, ident):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS topics(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, feeds TEXT NOT NULL, keywords TEXT NOT NULL, discovery INTEGER NOT NULL DEFAULT 0, next_run TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, title TEXT NOT NULL COLLATE NOCASE UNIQUE, scope TEXT NOT NULL, topic_id INTEGER REFERENCES topics, status TEXT NOT NULL DEFAULT 'active', demo INTEGER NOT NULL DEFAULT 0, cadence INTEGER NOT NULL DEFAULT 6, created_at TEXT NOT NULL, next_run TEXT NOT NULL, last_checked TEXT, pinned_prediction INTEGER);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, title TEXT NOT NULL COLLATE NOCASE, scope TEXT NOT NULL, topic_id INTEGER REFERENCES topics, status TEXT NOT NULL DEFAULT 'active', demo INTEGER NOT NULL DEFAULT 0, cadence INTEGER NOT NULL DEFAULT 6, created_at TEXT NOT NULL, next_run TEXT NOT NULL, last_checked TEXT, pinned_prediction INTEGER);
 CREATE TABLE IF NOT EXISTS source_state(event_id INTEGER NOT NULL REFERENCES events, feed TEXT NOT NULL, last_success TEXT, last_attempt TEXT, error TEXT, PRIMARY KEY(event_id,feed));
 CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY, url TEXT NOT NULL, digest TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL, published_at TEXT, observed_at TEXT NOT NULL, supersedes INTEGER REFERENCES documents, source_updated_at TEXT, published_label TEXT, source_times_checked INTEGER NOT NULL DEFAULT 0, UNIQUE(url,digest));
 CREATE INDEX IF NOT EXISTS doc_digest ON documents(digest);
@@ -99,6 +99,32 @@ DEFAULTS = {
 }
 
 
+def allow_event_title_reuse(c):
+    """Preserve event IDs and references while making names unique among tracked events."""
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        schema = c.execute("SELECT sql FROM sqlite_master WHERE name='events' AND type='table'").fetchone()[0]
+        title = "title TEXT NOT NULL COLLATE NOCASE"
+        if title + " UNIQUE" in schema:
+            indexes = list(c.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name='events' AND type IN ('index','trigger') AND sql IS NOT NULL"
+            ))
+            replacement = schema.replace("events", "events_upgrade", 1).replace(title + " UNIQUE", title, 1)
+            c.execute(replacement)
+            c.execute("INSERT INTO events_upgrade SELECT * FROM events")
+            c.execute("DROP TABLE events")
+            c.execute("ALTER TABLE events_upgrade RENAME TO events")
+            for (statement,) in indexes:
+                c.execute(statement)
+            if c.execute("PRAGMA foreign_key_check").fetchone():
+                raise ValueError("事件迁移未通过外键核对")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS event_title_in_use ON events(title) WHERE status!='deleted'")
+        c.commit()
+    except BaseException:
+        c.rollback()
+        raise
+
+
 class Store:
     def __init__(self, directory):
         self.directory = Path(directory).resolve()
@@ -106,8 +132,10 @@ class Store:
         self.path = self.directory / "evosight.sqlite3"
         with closing(sqlite3.connect(self.path, isolation_level=None)) as initial:
             initial.execute("PRAGMA journal_mode=WAL")
+            initial.execute("PRAGMA foreign_keys=OFF")
             initial.executescript(SCHEMA)
             initial.executescript(Path(__file__).with_name("workflow.sql").read_text(encoding="utf-8"))
+            allow_event_title_reuse(initial)
             from .discussion import allow_workspace_turns
 
             allow_workspace_turns(initial)
@@ -175,11 +203,13 @@ class Store:
                 lease
                 and lease[0] == self.path
                 and not c.execute(
-                    "SELECT 1 FROM jobs WHERE id=? AND owner=? AND status='running' AND lease>=?",
+                    """SELECT 1 FROM jobs j LEFT JOIN events e ON e.id=j.event_id
+                       WHERE j.id=? AND j.owner=? AND j.status='running' AND j.lease>=?
+                       AND (e.id IS NULL OR e.status!='deleted')""",
                     (lease[1], lease[2], utc()),
                 ).fetchone()
             ):
-                raise ValueError("任务租约已转移，旧执行者停止提交")
+                raise ValueError("任务租约已失效，旧执行者停止提交")
             yield c
             c.commit()
         except BaseException:
@@ -256,6 +286,8 @@ def mark_read(c, event, token):
 
 
 def enqueue(c, kind, *, event=None, topic=None, args=None, slot=None):
+    if event is not None:
+        require(c, "events", event)
     args = args or {}
     dedupe = f"{kind}:{event or 0}:{topic or 0}:{args.get('prediction_id',0)}:{args.get('fixed_id',0)}"
     for field in ("round_id", "platform", "snapshot_id", "task_id", "turn_id", "dispatch_key"):

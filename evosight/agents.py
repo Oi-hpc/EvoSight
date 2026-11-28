@@ -23,6 +23,7 @@ from .focus import Addition
 from .workspace_agent import Operation
 from .scenarios import Outlook, Scale
 from .contracts import (
+    ClaimReview,
     DeliveryAnswer,
     Followup,
     Plan,
@@ -74,6 +75,7 @@ class Forecast(Proposal):
     p: int | None = Field(default=None, ge=0, le=100)
     reason: str
     evidence_ids: list[int]
+    required_checks: list[Annotated[int, Field(ge=1, le=16)]] | None = Field(default=None, max_length=16)
     dependencies: list[Followup] = Field(default_factory=list, max_length=6)
     lesson_ids: list[int] = Field(default_factory=list, max_length=6)
     scale: Scale | None = None
@@ -111,6 +113,7 @@ class DiscussionAnswer(Proposal):
 
 
 CONTRACTS = {
+    "claim_review": ClaimReview,
     "study": Analysis,
     "discover": DiscoveryBatch,
     "forecast": Forecast,
@@ -123,6 +126,13 @@ CONTRACTS = {
 }
 RESEARCH_ROLES = {"study", "discover", "plan", "source_scout", *ROLE_INSTRUCTIONS}
 INSTRUCTIONS = {
+    "claim_review": (
+        "你负责独立核实报告中列出的关键答复。逐个 check_id 对照同一窗口内的归档原文，"
+        "核对主体、时间、数量、条件与适用人群，同时查阅其他调查者提供的相反原文。"
+        "每个核查项必须有且只有一个决定。原文直接支持完整答复才用 supported，附逐字引文、片段编号和理由。"
+        "索引、预期、一般条款不能证明正文、完成状态、特殊人群权益。证据不足或有未解决的冲突时用 return，"
+        "说明哪条推断过度、原文已经证明什么、原调查者还该查什么；有相关原文时附引文。"
+    ),
     "source_scout": "事件尚缺可用来源。用研究目标、主体原名和既有查源记录，提出最多三个真实的公开发布方入口，以及最多两条简短查询。优先来源自己的语言、监管机构和可逐期核验的数据。网址只填你有把握的 HTTPS 官方栏目或公共数据页。后台将实际读取原文、核对主体并归档，未知网址可留空。无需资料就可提查源线索。不要推测事实、行情或证券代码。",
     "study": "对照此前判断与本次新增资料，用简体中文分别写一条最重要的新事实、判断变化（维持也说明原因）、下一观察点。没有实质变化时三个文本均返回空串。子项沿用已有名称。最多两个子项和一个确有根据的关联事件。evidence_ids 只选直接依据的整数 ID。",
     "discover": "从授权主题和所给公开来源提出至多两个能独立研究的事件，用具体中文名称、范围以及理由。没有合适事件就返回空数组。",
@@ -160,6 +170,10 @@ INSTRUCTIONS[
     "study"
 ] += " 在 publication 按 task_id 和从1开始的 finding 序号决定每一项属于 event 或 world 并说明理由。材料覆盖、未查到原文、估算、对预测的意义留在事件；有独立出处的客观陈述可共享。一轮可新增零条世界知识。"
 INSTRUCTIONS["forecast"] += " 出题时给出可检验的关键假设和观察条件 dependencies。核对历史经验的适用范围和反例，在 lesson_ids 里列实际采用的输入经验 ID。"
+INSTRUCTIONS["forecast"] += (
+    " 输入含预测核查清单时，在 required_checks 列出本题使用或依赖的所有核查项序号，"
+    "包括尚待核实的前提。与清单完全无关时填 []。依赖待查项时选择 hold，写明是哪一项。"
+)
 INSTRUCTIONS["verify"] += " 存在可能已经决定结果但需要进一步核实的材料时 decisive_candidate=true，普通进展、仍待未来结果填 false。"
 INSTRUCTIONS[
     "verify"

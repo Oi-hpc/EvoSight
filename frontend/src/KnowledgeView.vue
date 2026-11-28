@@ -118,9 +118,28 @@ type Round = {
   window_end: string
   state: string
   detail: string
+  evidence_preview?: {
+    published_at: string
+    excerpts: {
+      question: string
+      quote: string
+      fragment_id: number
+      document_id: number
+      title: string
+      locator: string
+      in_event: boolean
+      url: string
+    }[]
+    pending: string[]
+  } | null
   plan: { rationale: string; postponed: string[] } | null
   tasks: Task[]
   coverage: { url: string; state: string; checked_at: string; recovery_round: number | null }[]
+  handoffs?: {
+    id: number; recipient: string; body: string; reason: string; documents: number[]
+    received_run: number | null; job_status: string | null; info: string | null; snapshot_id: number | null
+    forwarded_round: number | null; stopped_reason: string | null
+  }[]
   runs: {
     id: number
     role: string
@@ -628,6 +647,42 @@ const deliveryLabels = { confirmed: '已写入', unknown: '已写明证据缺口
               }}
             </p>
             <p>{{ r.detail }}</p>
+            <details v-if="r.evidence_preview" :open="r.state === 'researching'" class="kb-task">
+              <summary>阶段性材料 · {{ stamp(r.evidence_preview.published_at, true) }}</summary>
+              <p v-for="(excerpt, n) in r.evidence_preview.excerpts" :key="n">
+                <strong>{{ excerpt.question }}</strong><br />
+                <q>{{ excerpt.quote }}</q>
+                <a v-if="excerpt.in_event" :href="documents(excerpt.document_id, excerpt.fragment_id)">
+                  {{ excerpt.title }} · {{ excerpt.locator || '查看原文' }}
+                </a>
+                <a v-else-if="excerpt.url" :href="excerpt.url" target="_blank" rel="noopener noreferrer">
+                  {{ excerpt.title }} · 发布方原文
+                </a>
+              </p>
+              <p class="meta">发布时待查</p>
+              <ul>
+                <li v-for="(q, n) in r.evidence_preview.pending" :key="n">{{ q }}</li>
+              </ul>
+            </details>
+            <details v-if="r.handoffs?.length" class="kb-task">
+              <summary>交接与退回（{{ r.handoffs.length }}）</summary>
+              <div v-for="h in r.handoffs" :key="h.id">
+                <strong>{{ h.recipient }}</strong> · {{ h.reason }}
+                <p>{{ h.body }}</p>
+                <p class="meta">
+                  <template v-if="h.stopped_reason">{{ h.stopped_reason }}</template>
+                  <a v-else-if="h.forwarded_round" :href="'#/events/' + eventId + '/research/0/' + h.forwarded_round">
+                    已转交轮次 #{{ h.forwarded_round }}
+                  </a>
+                  <template v-else>
+                    {{ h.job_status ? label(h.job_status) : h.received_run ? '已收到' : '待接收' }}
+                    <span v-if="h.snapshot_id"> · 已纳入知识版本 #{{ h.snapshot_id }}</span>
+                    <span v-else-if="h.info"> · {{ h.info }}</span>
+                  </template>
+                </p>
+                <a v-for="id in h.documents" :key="id" :href="documents(id)">材料 #{{ id }} </a>
+              </div>
+            </details>
             <details v-if="r.runs?.length" class="kb-runs">
               <summary>{{ r.runs.length }} 次模型调用</summary>
               <p v-for="run in r.runs" :key="run.id">

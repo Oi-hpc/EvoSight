@@ -8,6 +8,26 @@ from evosight.contracts import Citation, DeliveryAnswer, Finding, Plan, Report, 
 from test_workflow import clock, new_event, setup
 
 
+def test_only_the_original_owners_gap_is_closed_by_an_admitted_supplement():
+    gap = "还缺申报正文"
+    other = "待核生效日"
+    finding = Finding(section="news", kind="fact", subject="监管提交",
+                      text="申报文件记载了交割", citations=[Citation(fragment_id=7, quote="completed")])
+    original = Report(gaps=[gap, other]).model_dump_json()
+    supplement = Report(findings=[finding], resolved_gaps=[
+        {"gap": gap, "fragment_id": 7}, {"gap": other, "fragment_id": 8},
+    ])
+    tasks = [{"id": n, "state": "done", "result": original} for n in (1, 2)]
+    tasks.append({"id": 3, "state": "done", "result": supplement.model_dump_json()})
+    owners = {3: {"原调查任务": 1}}
+    projected = delivery.reconcile_handoff_gaps(tasks, owners)
+    assert Report.model_validate_json(projected[0]["result"]).gaps == [other]
+    assert projected[1] == tasks[1] and tasks[0]["result"] == original
+    supplement.findings = []
+    tasks[2]["result"] = supplement.model_dump_json()
+    assert delivery.reconcile_handoff_gaps(tasks, owners) == tasks
+
+
 def test_invalid_optional_lookup_does_not_discard_the_research_plan():
     task = dict(
         role="news", question="哪天完成交割", target="公告", time_scope="window", done_when="取得交割公告", priority=3

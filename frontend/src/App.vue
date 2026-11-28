@@ -151,6 +151,11 @@ function saved(id?: number) {
   if (k === 'event' && id) go('events/' + id + '/research')
   if (k === 'topic') go('explore')
 }
+function eventDeleted() {
+  data.value = undefined
+  notify('追踪事件已删除')
+  go('home')
+}
 function doSearch() {
   if (view.value !== 'home') go('home')
 }
@@ -413,6 +418,7 @@ const due = computed(
           :revision="revision"
           @message="notify"
           @changed="refresh"
+          @deleted="eventDeleted"
           @form="openForm"
         />
         <DiscussionView

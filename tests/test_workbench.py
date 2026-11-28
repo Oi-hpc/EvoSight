@@ -1,11 +1,14 @@
 import asyncio
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from threading import Event
 
 import httpx
 import pytest
 
-from evosight import feeds, forecast, views
+from evosight import db, feeds, forecast, views, workflow, world
 from evosight.agents import (
     Analysis,
     Discovery,
@@ -403,6 +406,122 @@ def test_http_entry_points_local_origin_and_fixed_sample(store):
             assert (await client.get("/api/operations")).json()["profiles"]["study"][1] == "low"
 
     asyncio.run(case())
+
+
+def test_delete_tracking_event_through_api(store):
+    with store.connection(True) as c:
+        removed, kept = event(c, "旧追踪"), event(c, "独立追踪")
+        removed_job = workflow.begin_event(c, removed)
+        kept_job = workflow.begin_event(c, kept)
+        shared_doc = doc(c, removed)
+        assert doc(c, kept) == shared_doc
+        prediction = definition(c, removed, shared_doc)
+        deferred = enqueue(c, "forecast", event=removed)
+        c.execute("UPDATE jobs SET status='deferred' WHERE id=?", (deferred,))
+        claim = c.execute(
+            """INSERT INTO claims(event_id,role,section,kind,subject,text,precision,reason,refs,citations,identity,created_at)
+               VALUES(?,'news','news','reported','公告','共享公告正文','unknown','',?,'[]','shared',?)""",
+            (removed, dump([shared_doc]), utc()),
+        ).lastrowid
+        knowledge = world.register(c, claim)["entry_id"]
+        for ident in (removed, kept):
+            snapshot = c.execute(
+                """INSERT INTO knowledge_snapshots(event_id,goal_version,created_at,gaps,summary,changes)
+                   VALUES(?,1,?,'[]','共享背景','[]')""",
+                (ident, utc()),
+            ).lastrowid
+            c.execute("INSERT INTO snapshot_claims(snapshot_id,claim_id) VALUES(?,?)", (snapshot, claim))
+    app = make_app(store, Fake(), background=False)
+
+    async def case():
+        origin = "http://127.0.0.1"
+        headers = {"X-EvoSight": "local", "Origin": origin}
+        path = f"/api/events/{removed}"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+            assert (await client.delete(path)).status_code == 403
+            for _ in range(2):
+                result = await client.delete(path, headers=headers)
+                assert result.status_code == 200 and result.json() == {"ok": True}
+            for suffix in ("", "/timeline", "/discussion", f"/documents/{shared_doc}/fragments"):
+                assert (await client.get(path + suffix)).status_code == 404
+            assert (await client.post(path + "/status", headers=headers, json={"status": "active"})).status_code == 404
+            assert (await client.post(f"/api/jobs/{deferred}/retry", headers=headers)).status_code == 404
+            home = (await client.get("/api/home")).json()
+            assert [card["id"] for card in home["cards"]] == [kept] and home["stats"]["pending"] == 0
+            assert not (await client.get("/api/predictions")).json()["predictions"]
+            entry = (await client.get(f"/api/world/{knowledge}")).json()
+            assert entry["claim"]["id"] == claim
+            assert [event["id"] for event in entry["events"]] == [kept]
+            other = (await client.get(f"/api/events/{kept}")).json()
+            assert [e["id"] for e in other["documents"][0]["linked_events"]] == [kept]
+
+    asyncio.run(case())
+    with store.connection(True) as c:
+        schedule(c)
+        assert [r["status"] for r in rows(c, "SELECT status FROM jobs WHERE event_id=? ORDER BY id", (removed,))] == [
+            "cancelled", "cancelled",
+        ]
+        assert require(c, "tracking_rounds", removed_job["round"])["state"] == "cancelled"
+        assert require(c, "jobs", kept_job["job"])["status"] == "queued"
+        assert require(c, "predictions", prediction)["status"] == "open"
+        assert not list(c.execute("PRAGMA foreign_key_check"))
+
+
+def test_delete_event_prevents_a_running_worker_from_committing(store, monkeypatch):
+    with store.connection(True) as c:
+        ident = event(c)
+        job = workflow.begin_event(c, ident)["job"]
+    started, resume = Event(), Event()
+    worker = Worker(store, Fake())
+
+    def process(picked):
+        assert picked["id"] == job
+        with store.connection(True) as c:
+            book_run(c, job, "plan", "test", "low")
+        started.set()
+        assert resume.wait(10)
+        with store.connection(True) as c:
+            node(c, ident, "fact", "删除前启动的任务")
+        return "已提交"
+
+    monkeypatch.setattr(worker, "process", process)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(worker.step)
+        try:
+            assert started.wait(10)
+            with store.connection(True) as c:
+                workflow.delete_event(c, ident)
+                assert require(c, "jobs", job)["status"] == "running"
+        finally:
+            resume.set()
+        assert result.result(timeout=10)
+    with store.connection() as c:
+        assert require(c, "jobs", job)["status"] == "cancelled"
+        assert one(c, "SELECT status FROM runs WHERE job_id=?", (job,))["status"] == "interrupted"
+        assert not one(c, "SELECT id FROM nodes WHERE event_id=?", (ident,))
+
+
+def test_deleted_event_name_is_reusable_after_legacy_schema_upgrade(tmp_path):
+    legacy = db.SCHEMA.replace("COLLATE NOCASE, scope", "COLLATE NOCASE UNIQUE, scope", 1)
+    with closing(sqlite3.connect(tmp_path / "evosight.sqlite3")) as c:
+        c.executescript(legacy)
+        ident = c.execute(
+            "INSERT INTO events(title,scope,created_at,next_run) VALUES('Release','观察范围',?,?)",
+            (utc(), utc()),
+        ).lastrowid
+        c.execute("INSERT INTO reads VALUES(?,0)", (ident,))
+        c.commit()
+    migrated = Store(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError), migrated.connection(True) as c:
+        event(c, "release")
+    with migrated.connection(True) as c:
+        workflow.delete_event(c, ident)
+        replacement = event(c, "release")
+        assert replacement != ident
+    with Store(tmp_path).connection() as c:
+        assert require(c, "events", replacement)["title"] == "release"
+        assert one(c, "SELECT seen FROM reads WHERE event_id=?", (ident,)) == {"seen": 0}
+        assert not list(c.execute("PRAGMA foreign_key_check"))
 
 
 def test_budget_deferred_work_resumes_and_invalid_proposal_is_atomic(store):

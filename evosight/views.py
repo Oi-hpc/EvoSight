@@ -108,7 +108,7 @@ def card(c, e):
 
 
 def home(c):
-    cards = [card(c, e) for e in rows(c, "SELECT * FROM events")]
+    cards = [card(c, e) for e in rows(c, "SELECT * FROM events WHERE status!='deleted'")]
     cards.sort(key=lambda r: (r["unread"] > 0, r["updated"], r["id"]), reverse=True)
     return {
         "cards": cards,
@@ -118,9 +118,13 @@ def home(c):
             "events": len(cards),
             "unread": sum(r["unread"] for r in cards),
             "pending": c.execute(
-                "SELECT count(*) FROM predictions WHERE status IN ('open','frozen','review')"
+                """SELECT count(*) FROM predictions p JOIN events e ON e.id=p.event_id
+                   WHERE p.status IN ('open','frozen','review') AND e.status!='deleted'"""
             ).fetchone()[0],
-            "candidates": c.execute("SELECT count(*) FROM candidates WHERE state='review'").fetchone()[0],
+            "candidates": c.execute(
+                """SELECT count(*) FROM candidates c LEFT JOIN events e ON e.id=c.event_id
+                   WHERE c.state='review' AND e.status IS NOT 'deleted'"""
+            ).fetchone()[0],
         },
         "recent_jobs": rows(
             c,
@@ -141,7 +145,8 @@ def documents(c, event):
         )
         doc["linked_events"] = rows(
             c,
-            "SELECT e.id,e.title FROM events e JOIN event_docs ed ON ed.event_id=e.id WHERE ed.document_id=? ORDER BY e.title",
+            """SELECT e.id,e.title FROM events e JOIN event_docs ed ON ed.event_id=e.id
+               WHERE ed.document_id=? AND e.status!='deleted' ORDER BY e.title""",
             (doc["id"],),
         )
         if doc["supersedes"]:
@@ -170,7 +175,9 @@ def event_details(c, ident):
         ),
         "related": rows(
             c,
-            "SELECT e.id,e.title,count(*) AS shared FROM event_docs a JOIN event_docs b ON a.document_id=b.document_id JOIN events e ON e.id=b.event_id WHERE a.event_id=? AND b.event_id!=? GROUP BY e.id ORDER BY shared DESC",
+            """SELECT e.id,e.title,count(*) AS shared FROM event_docs a JOIN event_docs b ON a.document_id=b.document_id
+               JOIN events e ON e.id=b.event_id WHERE a.event_id=? AND b.event_id!=? AND e.status!='deleted'
+               GROUP BY e.id ORDER BY shared DESC""",
             (ident, ident),
         ),
     }
@@ -213,7 +220,12 @@ def explore(c):
     for t in ts:
         t["feeds"] = json.loads(t["feeds"])
         t["keywords"] = json.loads(t["keywords"])
-    cs = rows(c, "SELECT * FROM candidates ORDER BY CASE state WHEN 'review' THEN 0 ELSE 1 END,id DESC")
+    cs = rows(
+        c,
+        """SELECT c.* FROM candidates c LEFT JOIN events e ON e.id=c.event_id
+           LEFT JOIN events t ON t.id=c.target_id WHERE e.status IS NOT 'deleted' AND t.status IS NOT 'deleted'
+           ORDER BY CASE c.state WHEN 'review' THEN 0 ELSE 1 END,c.id DESC""",
+    )
     for item in cs:
         ids = json.loads(item["refs"])
         item["evidence"] = [one(c, "SELECT id,title,url FROM documents WHERE id=?", (i,)) for i in ids]
@@ -226,16 +238,19 @@ def ledger(c):
             {**forecast.detail(c, r["id"]), "event_title": r["title"], "demo": r["demo"]}
             for r in rows(
                 c,
-                "SELECT p.id,e.title,e.demo FROM predictions p JOIN events e ON e.id=p.event_id ORDER BY p.id DESC",
+                """SELECT p.id,e.title,e.demo FROM predictions p JOIN events e ON e.id=p.event_id
+                   WHERE e.status!='deleted' ORDER BY p.id DESC""",
             )
         ],
         "metrics": forecast.metrics(c),
         "fixed": rows(
             c,
-            "SELECT f.*,e.title AS event_title FROM fixed_questions f JOIN events e ON e.id=f.event_id ORDER BY f.id DESC",
+            """SELECT f.*,e.title AS event_title FROM fixed_questions f JOIN events e ON e.id=f.event_id
+               WHERE e.status!='deleted' ORDER BY f.id DESC""",
         ),
         "abstentions": rows(
             c,
-            "SELECT n.*,e.title AS event_title FROM forecast_notes n JOIN events e ON e.id=n.event_id ORDER BY n.id DESC LIMIT 50",
+            """SELECT n.*,e.title AS event_title FROM forecast_notes n JOIN events e ON e.id=n.event_id
+               WHERE e.status!='deleted' ORDER BY n.id DESC LIMIT 50""",
         ),
     }

@@ -55,6 +55,7 @@ def new(
 
 def revise(c, ident, p, reason, refs, model, *, at=None, outlook=None):
     pred = require(c, "predictions", ident)
+    require(c, "events", pred["event_id"])
     workflow.assert_revisable(c, pred)
     when = instant(at) if at else utc()
     last = one(c, "SELECT created_at FROM revisions WHERE prediction_id=? ORDER BY id DESC LIMIT 1", (ident,))
@@ -103,6 +104,7 @@ def settle(
     c, ident, outcome, public_at, reason, refs, lesson, actor, *, at=None, observed_level=None, observed_at=""
 ):
     pred = require(c, "predictions", ident)
+    require(c, "events", pred["event_id"])
     when = instant(at) if at else utc()
     scale = scenarios.definition(c, ident)
     allowed_outcomes = ("level",) if scale else ("yes", "no")
@@ -261,13 +263,15 @@ def metrics(c):
     for cohort in ("auto", "fixed"):
         group = rows(
             c,
-            "SELECT p.id,p.status FROM predictions p JOIN events e ON e.id=p.event_id WHERE p.cohort=? AND e.demo=0",
+            """SELECT p.id,p.status FROM predictions p JOIN events e ON e.id=p.event_id
+               WHERE p.cohort=? AND e.demo=0 AND e.status!='deleted'""",
             (cohort,),
         )
         due = (
             rows(
                 c,
-                "SELECT f.prediction_id FROM fixed_questions f JOIN events e ON e.id=f.event_id WHERE e.demo=0 AND f.deadline<=?",
+                """SELECT f.prediction_id FROM fixed_questions f JOIN events e ON e.id=f.event_id
+                   WHERE e.demo=0 AND e.status!='deleted' AND f.deadline<=?""",
                 (utc(),),
             )
             if cohort == "fixed"

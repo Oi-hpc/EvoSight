@@ -168,6 +168,12 @@ def make_app(store: Store, runner=None, *, background=True, acquisition=None):
         with store.connection() as c:
             return views.event_details(c, event)
 
+    @app.delete("/api/events/{event}")
+    def delete_event(event: int):
+        with store.connection(True) as c:
+            workflow.delete_event(c, event)
+            return {"ok": True}
+
     @app.get("/api/events/{event}/timeline")
     def timeline(
         event: int,
@@ -241,7 +247,8 @@ def make_app(store: Store, runner=None, *, background=True, acquisition=None):
     @app.post("/api/items/{ident}/pin")
     def pin(ident: int, data: Switch):
         with store.connection(True) as c:
-            require(c, "items", ident)
+            item = require(c, "items", ident)
+            require(c, "events", item["event_id"])
             c.execute("UPDATE items SET pinned=? WHERE id=?", (data.enabled, ident))
             return {"ok": True}
 
@@ -281,6 +288,8 @@ def make_app(store: Store, runner=None, *, background=True, acquisition=None):
             if data.action == "accept":
                 return {"id": admit(c, ident)}
             record = require(c, "candidates", ident)
+            if record["event_id"] is not None:
+                require(c, "events", record["event_id"])
             if record["state"] != "review":
                 raise ValueError("该候选已处理")
             c.execute("UPDATE candidates SET state='dismissed' WHERE id=?", (ident,))
@@ -360,6 +369,7 @@ def make_app(store: Store, runner=None, *, background=True, acquisition=None):
     def pin_prediction(ident: int, data: Switch):
         with store.connection(True) as c:
             p = require(c, "predictions", ident)
+            require(c, "events", p["event_id"])
             c.execute(
                 "UPDATE events SET pinned_prediction=? WHERE id=?",
                 (ident if data.enabled else None, p["event_id"]),
@@ -389,7 +399,7 @@ def make_app(store: Store, runner=None, *, background=True, acquisition=None):
             return {
                 "jobs": rows(
                     c,
-                    """SELECT j.*,e.title AS event_title,t.name AS topic_name FROM jobs j
+                    """SELECT j.*,e.title AS event_title,e.status AS event_status,t.name AS topic_name FROM jobs j
                     LEFT JOIN events e ON e.id=j.event_id LEFT JOIN topics t ON t.id=j.topic_id
                     WHERE (? IS NULL OR j.id=?) ORDER BY j.id DESC LIMIT 100""",
                     (job, job),
@@ -410,6 +420,8 @@ def make_app(store: Store, runner=None, *, background=True, acquisition=None):
     def retry(ident: int):
         with store.connection(True) as c:
             j = require(c, "jobs", ident)
+            if j["event_id"] is not None:
+                require(c, "events", j["event_id"])
             if j["status"] not in ("deferred", "failed"):
                 raise ValueError("任务当前无需重试")
             if j["kind"] == "discussion":

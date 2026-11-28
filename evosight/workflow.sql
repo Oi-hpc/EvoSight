@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS research_tasks (
     priority INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'queued', detail TEXT NOT NULL DEFAULT '',
     result TEXT, input_ids TEXT, UNIQUE(round_id,role,question)
 );
+CREATE TABLE IF NOT EXISTS round_evidence_previews (
+    round_id INTEGER PRIMARY KEY REFERENCES tracking_rounds, due_at TEXT NOT NULL,
+    published_at TEXT, excerpts TEXT, pending TEXT
+);
 CREATE TABLE IF NOT EXISTS model_receipts (
     job_id INTEGER NOT NULL REFERENCES jobs, role TEXT NOT NULL, input_hash TEXT NOT NULL,
     response TEXT NOT NULL, model TEXT NOT NULL, run_id INTEGER REFERENCES runs,
@@ -349,6 +353,20 @@ CREATE TABLE IF NOT EXISTS investigation_lines (
     goal_version INTEGER NOT NULL,question TEXT NOT NULL,role TEXT NOT NULL,last_task INTEGER REFERENCES research_tasks,
     UNIQUE(event_id,line_key)
 );
+CREATE TABLE IF NOT EXISTS investigation_wakes (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs, round_id INTEGER NOT NULL REFERENCES tracking_rounds,
+    line_id INTEGER NOT NULL REFERENCES investigation_lines, owner_task INTEGER NOT NULL REFERENCES research_tasks,
+    task_id INTEGER UNIQUE REFERENCES research_tasks, context TEXT, snapshot_id INTEGER REFERENCES knowledge_snapshots
+);
+CREATE INDEX IF NOT EXISTS wakes_by_round ON investigation_wakes(round_id,line_id);
+CREATE TABLE IF NOT EXISTS investigation_wake_notes (
+    delivery_key TEXT PRIMARY KEY, note_id INTEGER NOT NULL UNIQUE REFERENCES handoff_inbox,
+    job_id INTEGER NOT NULL REFERENCES investigation_wakes, fragment_ids TEXT NOT NULL,
+    forwarded_to INTEGER REFERENCES event_notes
+);
+CREATE TABLE IF NOT EXISTS investigation_wake_stops (
+    note_id INTEGER PRIMARY KEY REFERENCES investigation_wake_notes(note_id), reason TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS field_evidence (
     version_id INTEGER NOT NULL REFERENCES claims,field TEXT NOT NULL,fragment_id INTEGER NOT NULL REFERENCES fragments,
     quote TEXT NOT NULL,PRIMARY KEY(version_id,field,fragment_id)
@@ -360,6 +378,11 @@ CREATE TABLE IF NOT EXISTS dispute_resolutions (
 CREATE TABLE IF NOT EXISTS snapshot_checklist (
     snapshot_id INTEGER NOT NULL REFERENCES knowledge_snapshots, position INTEGER NOT NULL,
     question TEXT NOT NULL, rejection TEXT NOT NULL DEFAULT '', PRIMARY KEY(snapshot_id,position)
+);
+CREATE TABLE IF NOT EXISTS research_review_finding_returns (
+    task_id INTEGER NOT NULL REFERENCES research_tasks ON DELETE CASCADE, check_id INTEGER NOT NULL,
+    finding_hash TEXT NOT NULL, reason TEXT NOT NULL,
+    PRIMARY KEY(task_id,check_id,finding_hash)
 );
 CREATE TABLE IF NOT EXISTS delivery_answers (
     snapshot_id INTEGER NOT NULL, position INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('confirmed','unknown')),

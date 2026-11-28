@@ -30,10 +30,21 @@ def main_session_backend(c, event):
 
 
 def current_goal(c, event):
-    goal = one(c, "SELECT * FROM event_goals WHERE event_id=? ORDER BY version DESC LIMIT 1", (event,))
+    goal = one(
+        c,
+        """SELECT g.* FROM event_goals g JOIN events e ON e.id=g.event_id
+           WHERE g.event_id=? AND e.status!='deleted' ORDER BY g.version DESC LIMIT 1""",
+        (event,),
+    )
     if not goal:
         raise KeyError("事件不存在")
-    goal["related"] = json.loads(goal["related"])
+    goal["related"] = [
+        row[0] for row in c.execute(
+            """SELECT e.id FROM json_each(?) j JOIN events e ON e.id=j.value
+               WHERE e.status!='deleted' ORDER BY j.key""",
+            (goal["related"],),
+        )
+    ]
     return goal
 
 
@@ -90,6 +101,38 @@ def begin_event(c, event):
     intervals = max(0, (datetime.fromisoformat(utc()) - anchor) // period) + 1
     c.execute("UPDATE events SET next_run=? WHERE id=?", (utc(anchor + intervals * period), event))
     return {"id": event, "job": job, "round": rid}
+
+
+EVENT_DELETED = "追踪事件已删除"
+
+
+def delete_event(c, event):
+    record = one(c, "SELECT status,demo FROM events WHERE id=?", (event,))
+    if not record:
+        raise KeyError("事件不存在")
+    if record["demo"]:
+        raise ValueError("演示事件只供阅读")
+    if record["status"] == "deleted":
+        return
+    now = utc()
+    c.execute("UPDATE events SET status='deleted' WHERE id=?", (event,))
+    # A running worker keeps its slot until it exits, but its lease can no longer commit results.
+    c.execute(
+        """UPDATE jobs SET status='cancelled',info=?,finished_at=?,retry_at=NULL
+           WHERE event_id=? AND status IN ('queued','deferred')""",
+        (EVENT_DELETED, now, event),
+    )
+    c.execute(
+        """UPDATE tracking_rounds SET state='cancelled',detail=?,finished_at=?
+           WHERE event_id=? AND state IN ('queued','planning','researching','waiting','deferred')""",
+        (EVENT_DELETED, now, event),
+    )
+    c.execute(
+        """UPDATE research_tasks SET state='cancelled',detail=?
+           WHERE state IN ('queued','running','deferred') AND round_id IN
+           (SELECT id FROM tracking_rounds WHERE event_id=?)""",
+        (EVENT_DELETED, event),
+    )
 
 
 def edit_goal(c, event, expected, *, title=None, scope=None, priority=None, related=None, status=None):
@@ -149,12 +192,13 @@ def edit_goal(c, event, expected, *, title=None, scope=None, priority=None, rela
 
 
 def respond_end(c, event, proposal, choice):
+    goal = current_goal(c, event)
     item = require(c, "end_proposals", proposal)
     if item["event_id"] != event:
         raise KeyError()
     if item["status"] == choice:
         return {"status": choice}
-    if item["status"] != "pending" or item["goal_version"] != current_goal(c, event)["version"]:
+    if item["status"] != "pending" or item["goal_version"] != goal["version"]:
         raise VersionConflict("结束建议已处理或目标已更新")
     c.execute("UPDATE end_proposals SET status=? WHERE id=?", (choice, proposal))
     if choice == "archived":
@@ -196,7 +240,8 @@ def applicable_lessons(c, event):
     records = rows(
         c,
         """SELECT o.id,o.event_id,e.title,o.question,o.condition,o.state FROM observations o JOIN events e ON e.id=o.event_id
-                    WHERE o.origin='待验证经验' AND e.demo=(SELECT demo FROM events WHERE id=?) AND (o.event_id=? OR EXISTS(SELECT 1 FROM json_each(?) j WHERE j.value=o.event_id)
+                    WHERE o.origin='待验证经验' AND e.status!='deleted'
+                    AND e.demo=(SELECT demo FROM events WHERE id=?) AND (o.event_id=? OR EXISTS(SELECT 1 FROM json_each(?) j WHERE j.value=o.event_id)
                       OR EXISTS(SELECT 1 FROM snapshot_claims a JOIN world_versions va ON va.claim_id=a.claim_id
                                 JOIN world_versions vb ON vb.entry_id=va.entry_id JOIN snapshot_claims b ON b.claim_id=vb.claim_id
                                 WHERE a.snapshot_id=(SELECT max(id) FROM knowledge_snapshots WHERE event_id=?)
@@ -214,7 +259,8 @@ def applicable_lessons(c, event):
             c,
             """SELECT r.event_id,e.title,r.outcome,r.reason,r.fragment_id,a.document_id,r.created_at
                                 FROM lesson_reviews r JOIN events e ON e.id=r.event_id JOIN fragments f ON f.id=r.fragment_id
-                                JOIN evidence_assets a ON a.id=f.asset_id WHERE r.lesson_id=? ORDER BY r.id""",
+                                JOIN evidence_assets a ON a.id=f.asset_id
+                                WHERE r.lesson_id=? AND e.status!='deleted' ORDER BY r.id""",
             (record["id"],),
         )
     return records
@@ -222,6 +268,7 @@ def applicable_lessons(c, event):
 
 def review_lesson(c, event, lesson_id, fragment_id, outcome, reason):
     lesson = require(c, "observations", lesson_id)
+    require(c, "events", lesson["event_id"])
     if require(c, "events", event)["demo"] or lesson["origin"] != "待验证经验" or not reason.strip():
         raise ValueError("请选择复盘经验并说明适用范围或反例")
     if outcome == "withdraw" and lesson["event_id"] != event:
@@ -342,6 +389,15 @@ def list_rounds(c, event, rid=None):
     for r in result:
         r["reasons"] = json.loads(r["reasons"])
         r["plan"] = json.loads(r["plan"]) if r["plan"] else None
+        preview = one(
+            c,
+            "SELECT published_at,excerpts,pending FROM round_evidence_previews WHERE round_id=? AND published_at IS NOT NULL",
+            (r["id"],),
+        )
+        if preview:
+            preview["excerpts"] = json.loads(preview["excerpts"])
+            preview["pending"] = json.loads(preview["pending"])
+        r["evidence_preview"] = preview
         r["tasks"] = rows(
             c,
             "SELECT id,role,question,target,time_scope,done_when,priority,state,detail FROM research_tasks WHERE round_id=? ORDER BY priority DESC,id",
@@ -359,13 +415,30 @@ def list_rounds(c, event, rid=None):
             "SELECT url,state,window_start,window_end,checked_at,recovery_round FROM round_sources WHERE round_id=?",
             (r["id"],),
         )
+        r["handoffs"] = rows(
+            c,
+            """SELECT n.id,n.subject AS recipient,n.body,n.reason,i.documents,i.received_run,
+                      j.status AS job_status,j.info,w.snapshot_id,destination.round_id AS forwarded_round,
+                      stopped.reason AS stopped_reason
+               FROM event_notes n JOIN handoff_inbox i ON i.note_id=n.id
+               LEFT JOIN investigation_wake_notes wn ON wn.note_id=n.id
+               LEFT JOIN investigation_wakes w ON w.job_id=wn.job_id
+               LEFT JOIN jobs j ON j.id=w.job_id
+               LEFT JOIN event_notes destination ON destination.id=wn.forwarded_to
+               LEFT JOIN investigation_wake_stops stopped ON stopped.note_id=n.id
+               WHERE n.event_id=? AND n.round_id=? ORDER BY n.id""",
+            (event, r["id"]),
+        )
+        for handoff in r["handoffs"]:
+            handoff["documents"] = json.loads(handoff["documents"])
         r["runs"] = rows(
             c,
             """SELECT m.id,m.role,m.model,m.effort,m.status,m.elapsed,m.input_tokens,m.output_tokens FROM runs m
                       JOIN jobs j ON j.id=m.job_id WHERE j.id=? OR (j.event_id=? AND (json_extract(j.args,'$.round_id')=?
+                      OR json_extract(j.args,'$.source_round')=?
                       OR json_extract(j.args,'$.snapshot_id') IN (SELECT id FROM knowledge_snapshots WHERE round_id=?)))
                       ORDER BY m.id""",
-            (r["job_id"], event, r["id"], r["id"]),
+            (r["job_id"], event, r["id"], r["id"], r["id"]),
         )
     return result
 
@@ -747,7 +820,8 @@ def refresh_shared_indexes(c, origin, changed):
                        FROM world_entries w JOIN world_versions v ON v.entry_id=w.id
                        JOIN snapshot_claims s ON s.claim_id=v.claim_id JOIN knowledge_snapshots n ON n.id=s.snapshot_id
                        JOIN claims prior ON prior.id=s.claim_id
-                       JOIN claims k ON k.id=w.head_id WHERE n.event_id!=? AND v.canonical_id!=w.head_id
+                       JOIN claims k ON k.id=w.head_id JOIN events e ON e.id=n.event_id
+                       WHERE n.event_id!=? AND e.status!='deleted' AND v.canonical_id!=w.head_id
                        AND w.head_id IN (SELECT value FROM json_each(?))
                        AND n.id=(SELECT max(id) FROM knowledge_snapshots WHERE event_id=n.event_id)""",
         (origin, dump(sorted(changed))),
@@ -849,7 +923,7 @@ def migrate_existing_knowledge(c):
 
     for event in rows(
         c,
-        """SELECT e.* FROM events e WHERE EXISTS(SELECT 1 FROM nodes WHERE event_id=e.id)
+        """SELECT e.* FROM events e WHERE e.status!='deleted' AND EXISTS(SELECT 1 FROM nodes WHERE event_id=e.id)
                            AND NOT EXISTS(SELECT 1 FROM knowledge_snapshots WHERE event_id=e.id)
                            AND NOT EXISTS(SELECT 1 FROM tracking_rounds WHERE event_id=e.id)""",
     ):

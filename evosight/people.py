@@ -257,13 +257,15 @@ def account_list(c, event, target):
         c,
         """SELECT a.*,coalesce((SELECT ed.event_id FROM event_docs ed WHERE ed.document_id=a.proof_doc AND ed.event_id=?),
               (SELECT ed.event_id FROM event_docs ed JOIN events e ON e.id=ed.event_id
-              WHERE ed.document_id=a.proof_doc AND e.demo=a.demo ORDER BY ed.event_id LIMIT 1)) AS proof_event
+              WHERE ed.document_id=a.proof_doc AND e.demo=a.demo AND e.status!='deleted'
+              ORDER BY ed.event_id LIMIT 1)) AS proof_event
               FROM person_accounts a WHERE a.entity_id=? AND a.demo=(SELECT demo FROM events WHERE id=?) ORDER BY a.platform,a.id""",
         (event, target["entity_id"], event),
     )
 
 
 def review_account(c, event, target_id, account_id, confirm):
+    require(c, "events", event)
     target = require(c, "person_targets", target_id)
     if target["event_id"] != event:
         raise KeyError()

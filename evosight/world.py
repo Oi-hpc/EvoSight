@@ -115,7 +115,7 @@ def register(c, ident, *, category=None, key=None, path="", attributes=None):
     if known:
         return known
     item = require(c, "claims", ident)
-    demo = require(c, "events", item["event_id"])["demo"]
+    demo = one(c, "SELECT demo FROM events WHERE id=?", (item["event_id"],))["demo"]
     parent = version(c, item["replaces"]) if item["replaces"] else None
     detail = one(c, "SELECT * FROM claim_details WHERE claim_id=?", (ident,)) or {}
     entity = require(c, "entities", item["entity_id"]) if item["entity_id"] else {}
@@ -315,7 +315,7 @@ def detail(c, entry, revision=None):
         c,
         """SELECT e.id,e.title,s.index_section,s.index_reason FROM events e
                     JOIN knowledge_snapshots n ON n.event_id=e.id JOIN snapshot_claims s ON s.snapshot_id=n.id
-                    JOIN world_versions v ON v.claim_id=s.claim_id WHERE v.entry_id=?
+                    JOIN world_versions v ON v.claim_id=s.claim_id WHERE v.entry_id=? AND e.status!='deleted'
                     AND n.id=(SELECT max(id) FROM knowledge_snapshots WHERE event_id=e.id) ORDER BY e.id""",
         (entry,),
     )

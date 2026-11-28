@@ -121,7 +121,7 @@ def doc_owner(c, event, doc):
     row = one(
         c,
         """SELECT ed.event_id FROM event_docs ed JOIN events e ON e.id=ed.event_id
-        WHERE ed.document_id=? AND e.demo=(SELECT demo FROM events WHERE id=?)
+        WHERE ed.document_id=? AND e.status!='deleted' AND e.demo=(SELECT demo FROM events WHERE id=?)
         ORDER BY (ed.event_id=?) DESC,ed.event_id LIMIT 1""",
         (doc, event, event),
     )
@@ -383,7 +383,7 @@ def workspace_history(c, limit=6):
         """SELECT t.event_id,e.title AS event,t.question,t.revision_id,t.basis,substr(t.answer,1,1200) AS answer
         FROM discussion_turns t LEFT JOIN events e ON e.id=t.event_id
         WHERE t.answer IS NOT NULL
-        AND (t.event_id IS NULL OR e.demo=0) ORDER BY t.id DESC LIMIT ?""",
+        AND (t.event_id IS NULL OR (e.demo=0 AND e.status!='deleted')) ORDER BY t.id DESC LIMIT ?""",
         (limit,),
     )
 
@@ -587,7 +587,8 @@ def conversation(c, event, revision, basis, before=0):
         """SELECT t.id,t.event_id,e.title AS event_title,t.revision_id,t.basis,t.provider,t.question,t.created_at,t.answered_at,t.snapshot_id,t.job_id,t.run_id,
             t.answer,t.citations,j.status,j.info,r.model,r.effort FROM discussion_turns t
             JOIN jobs j ON j.id=t.job_id LEFT JOIN runs r ON r.id=t.run_id LEFT JOIN events e ON e.id=t.event_id
-            WHERE ((t.event_id=? AND t.revision_id IS ? AND t.basis=?) OR (? IS NULL AND (e.demo=0 OR t.event_id IS NULL)))
+            WHERE ((t.event_id=? AND t.revision_id IS ? AND t.basis=?)
+            OR (? IS NULL AND (t.event_id IS NULL OR (e.demo=0 AND e.status!='deleted'))))
             AND (?=0 OR t.id<?)
             ORDER BY t.id DESC LIMIT 21""",
         (event, revision, basis, event, before, before),
@@ -599,7 +600,8 @@ def conversation(c, event, revision, basis, before=0):
         receipts = rows(
             c,
             """SELECT a.turn_id,a.focus_id,a.added,a.round_id,r.state,r.event_id FROM discussion_focus a
-            JOIN tracking_rounds r ON r.id=a.round_id WHERE a.turn_id IN (SELECT value FROM json_each(?))
+            JOIN tracking_rounds r ON r.id=a.round_id JOIN events e ON e.id=r.event_id
+            WHERE e.status!='deleted' AND a.turn_id IN (SELECT value FROM json_each(?))
             ORDER BY a.turn_id,a.focus_id""",
             (dump(list(by_turn)),),
         )
@@ -612,7 +614,8 @@ def conversation(c, event, revision, basis, before=0):
             """SELECT a.turn_id,a.position,a.action,a.event_id,e.title AS event_title,a.summary,a.round_id,
             a.job_id,j.status AS job_status,r.state AS round_state,a.before_state,a.after_state FROM workflow_actions a JOIN events e ON e.id=a.event_id
             LEFT JOIN jobs j ON j.id=a.job_id
-            LEFT JOIN tracking_rounds r ON r.id=a.round_id WHERE a.turn_id IN (SELECT value FROM json_each(?))
+            LEFT JOIN tracking_rounds r ON r.id=a.round_id
+            WHERE e.status!='deleted' AND a.turn_id IN (SELECT value FROM json_each(?))
             ORDER BY a.turn_id,a.position""",
             (dump(list(by_turn)),),
         ):

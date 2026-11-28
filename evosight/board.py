@@ -39,12 +39,15 @@ def note(
     task=None,
     at=None,
     documents=(),
+    handoff_version=None,
 ):
     from .workflow import fingerprint
 
     parts = [goal, question, subject, body, citations]
     if kind == "handoff":
         parts.extend([rid, task, list(documents)])
+        if handoff_version:
+            parts.append(handoff_version)
     key = fingerprint(*parts)
     c.execute(
         """INSERT OR IGNORE INTO event_notes(event_id,goal_version,round_id,task_id,question,subject,body,
@@ -59,7 +62,9 @@ def inbox(c, event, recipient):
     messages = rows(
         c,
         """SELECT n.id,n.question,n.body,i.documents FROM handoff_inbox i JOIN event_notes n ON n.id=i.note_id
-                        WHERE n.event_id=? AND n.subject=? AND i.received_run IS NULL AND n.goal_version=(
+                        WHERE n.event_id=? AND n.subject=? AND i.received_run IS NULL
+                        AND NOT EXISTS(SELECT 1 FROM investigation_wake_notes k WHERE k.note_id=n.id)
+                        AND n.goal_version=(
                             SELECT max(version) FROM event_goals WHERE event_id=n.event_id) ORDER BY n.id LIMIT 12""",
         (event, recipient),
     )
@@ -247,7 +252,11 @@ def view(c, event, goal):
     lines = rows(
         c,
         """SELECT l.id,l.line_key,l.question,l.role,t.id task_id,t.state,t.done_when,t.result FROM investigation_lines l
-              JOIN research_tasks t ON t.id=l.last_task WHERE l.event_id=? AND l.goal_version=? ORDER BY l.id DESC LIMIT 24""",
+              JOIN research_tasks t ON t.id=COALESCE((
+                SELECT w.task_id FROM investigation_wakes w JOIN research_tasks s ON s.id=w.task_id
+                WHERE w.line_id=l.id AND w.owner_task=l.last_task AND s.state='done'
+                ORDER BY w.job_id DESC LIMIT 1), l.last_task)
+              WHERE l.event_id=? AND l.goal_version=? ORDER BY l.id DESC LIMIT 24""",
         (event, goal),
     )
     for line in lines:

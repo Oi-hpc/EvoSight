@@ -5,10 +5,12 @@ from datetime import datetime, timedelta
 import json
 from itertools import zip_longest
 import re
+import time
 
 from . import (
     board,
     cards,
+    claim_review,
     delivery,
     feeds,
     focus,
@@ -16,6 +18,7 @@ from . import (
     materials,
     people,
     resources,
+    wakes,
     watch,
     workflow,
     world,
@@ -25,6 +28,108 @@ from . import (
 from .agents import Analysis
 from .contracts import Assignment, Plan, Report, ROLE_NAMES, FACETS
 from .db import DispatchDeferred, config, dump, enqueue, instant, later, node, one, require, rows, usage, utc
+
+
+INTERIM_REPORT_AFTER_SECONDS = 120
+
+
+def interim_deadline(c, rid, tasks):
+    if not tasks:
+        return None
+    c.execute(
+        "INSERT OR IGNORE INTO round_evidence_previews(round_id,due_at) VALUES(?,?)",
+        (rid, later(INTERIM_REPORT_AFTER_SECONDS)),
+    )
+    row = one(c, "SELECT due_at,published_at FROM round_evidence_previews WHERE round_id=?", (rid,))
+    if not row["published_at"]:
+        remaining = datetime.fromisoformat(row["due_at"]) - datetime.fromisoformat(utc())
+        return time.monotonic() + max(0, remaining.total_seconds())
+
+
+def pending_handoffs(c, rid, visible):
+    return [row[0] for row in c.execute(
+        """SELECT DISTINCT '交接补查 · ' || owner.question FROM investigation_wakes w
+           JOIN jobs j ON j.id=w.job_id JOIN research_tasks owner ON owner.id=w.owner_task
+           WHERE w.round_id=? AND w.snapshot_id IS NULL AND (
+             (w.task_id IS NULL AND j.status IN ('queued','running','deferred')) OR
+             (w.task_id IS NOT NULL AND w.task_id NOT IN (SELECT value FROM json_each(?))))
+           ORDER BY 1""", (rid, dump([t["id"] for t in visible]))
+    )]
+
+
+def publish_interim(c, r):
+    """Freeze source excerpts independently of synthesis, without adopting claims or starting forecasts."""
+    if not workflow.goal_matches(c, r):
+        return False
+    tasks = rows(c, "SELECT * FROM research_tasks WHERE round_id=? ORDER BY priority DESC,id", (r["id"],))
+    tasks = claim_review.previously_returned(c, r, tasks)
+    pending = [t["question"] for t in tasks if t["state"] != "done"] + pending_handoffs(c, r["id"], tasks)
+    if not pending:
+        return False
+    excerpts = []
+    for task in tasks:
+        if task["state"] != "done" or not task["result"]:
+            continue
+        citations = [
+            ref for finding in validated_task_report(c, task).findings
+            if finding.kind in ("fact", "reported") for ref in finding.citations
+        ]
+        fragments = rows(
+            c,
+            """SELECT f.id,f.text,f.locator,a.document_id,d.title,d.url,
+                      EXISTS(SELECT 1 FROM event_docs e WHERE e.document_id=d.id AND e.event_id=?) in_event
+               FROM fragments f JOIN evidence_assets a ON a.id=f.asset_id JOIN documents d ON d.id=a.document_id
+               WHERE f.id IN (SELECT value FROM json_each(?)) AND d.id IN (SELECT value FROM json_each(?))
+               AND julianday(coalesce(nullif(d.published_at,''),d.observed_at))<=julianday(?)
+               AND (nullif(d.source_updated_at,'') IS NULL OR julianday(d.source_updated_at)<=julianday(?))""",
+            (r["event_id"], dump([ref.fragment_id for ref in citations]), task["input_ids"] or "[]",
+             r["window_end"], r["window_end"]),
+        )
+        visible = {f["id"]: f for f in fragments}
+        # Show a few excerpts from each completed line so one long filing cannot bury the others.
+        seen = set()
+        for ref in citations:
+            f = visible.get(ref.fragment_id)
+            quote = grounding.verbatim(f["text"], ref.quote) if f else None
+            if not quote or (ref.fragment_id, quote) in seen:
+                continue
+            excerpts.append({
+                "question": task["question"], "quote": quote, "fragment_id": ref.fragment_id,
+                "document_id": f["document_id"], "locator": f["locator"], "title": f["title"],
+                "in_event": bool(f["in_event"]), "url": f["url"] if f["url"].startswith(("https://", "http://")) else "",
+            })
+            seen.add((ref.fragment_id, quote))
+            if len(seen) == 3:
+                break
+    if not excerpts:
+        return False
+    return bool(c.execute(
+        """UPDATE round_evidence_previews SET published_at=?,excerpts=?,pending=?
+           WHERE round_id=? AND published_at IS NULL""",
+        (utc(), dump(excerpts), dump(pending), r["id"]),
+    ).rowcount)
+
+
+def drain_wakes(worker, r, deadline):
+    """Lend the only dispatcher to queued handoffs, keeping the original delivery clock."""
+    with worker.store.connection() as c:
+        jobs = rows(c, """SELECT w.job_id FROM investigation_wakes w JOIN jobs j ON j.id=w.job_id
+                        WHERE w.round_id=? AND j.status='queued' ORDER BY j.id""", (r["id"],))
+    if not jobs or deadline is None:
+        return
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="evosight-handoff") as borrowed:
+        for wake in jobs:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not remaining:
+                with worker.store.connection(True) as c:
+                    publish_interim(c, r)
+                return  # The ordinary queue will run the remaining durable work.
+            future = borrowed.submit(copy_context().run, worker.step, wake_job=wake["job_id"])
+            done, _ = wait([future], timeout=remaining)
+            if not done:
+                with worker.store.connection(True) as c:
+                    publish_interim(c, r)
+            future.result()  # Leave the running wake's lease and receipts intact until completion.
 
 
 def model_fragments(fragments):
@@ -477,7 +582,8 @@ def study_context(c, r):
     prior = [k for k in prior if k["world_id"] not in hidden]
     goal = workflow.current_goal(c, event)
     objects = rows(
-        c, "SELECT id,title,scope FROM events WHERE id!=? AND (demo=0 OR ?=1) LIMIT 36", (event, e["demo"])
+        c, "SELECT id,title,scope FROM events WHERE id!=? AND status!='deleted' AND (demo=0 OR ?=1) LIMIT 36",
+        (event, e["demo"]),
     )
     suggestions = world.suggested(c, event)
     routes = world_catalog.route(e["title"] + " " + e["scope"])
@@ -948,19 +1054,7 @@ def role_lookup(worker, r, task, request):
                 "world_records": records,
                 "documents": list(dict.fromkeys(d for rec in records for d in rec.get("refs", []))),
             }
-        permitted = [
-            d
-            for d in dict.fromkeys(request.document_ids)
-            if one(
-                c,
-                """SELECT 1 FROM event_docs ed
-                     JOIN documents d ON d.id=ed.document_id WHERE ed.event_id=? AND d.id=?
-                     AND ed.intake NOT IN ('future','person_candidate') AND (d.published_at IS NULL OR d.published_at<=?)
-                     AND (d.observed_at<=? OR d.id IN (SELECT value FROM json_each(?)) OR EXISTS (
-                         SELECT 1 FROM research_tasks t,json_each(t.input_ids) j WHERE t.round_id=? AND j.value=d.id))""",
-                (event, d, r["window_end"], r["window_end"], r["input_docs"] or "[]", r["id"]),
-            )
-        ]
+        permitted = wakes.permitted_documents(c, r, request.document_ids)
         if request.tool == "read":
             return {"documents": permitted}
         recipient = request.recipient or "主 Agent"
@@ -974,23 +1068,7 @@ def role_lookup(worker, r, task, request):
             if len(matches) != 1:
                 return {"error": "请从黑板选择一条现有调查线，或交给主 Agent"}
             recipient = matches[0]["line_key"]
-        ident = board.note(
-            c,
-            event,
-            r["goal_version"],
-            task["question"],
-            recipient,
-            query,
-            "handoff",
-            "侦查员交接",
-            [],
-            rid=r["id"],
-            task=task["id"],
-            documents=permitted,
-        )
-        c.execute(
-            "INSERT OR IGNORE INTO handoff_inbox(note_id,documents) VALUES(?,?)", (ident, dump(permitted))
-        )
+        ident = wakes.post(c, r, task["id"], recipient, task["question"], query, permitted)
         return {"recipient": recipient, "message_id": ident, "documents": permitted}
 
 
@@ -1011,7 +1089,9 @@ def run_role(worker, job, r, plan, ctx, ids, t):
             worker, r, t, assignment, role_context, list(dict.fromkeys([*ids, *historical_docs]))
         )
         with worker.store.connection() as c:
-            frags = materials.fragments_for(c, inputs, per_document=None)
+            pinned = role_context.get("交接原文片段")
+            frags = (wakes.frozen_fragments(c, pinned) if pinned is not None
+                     else materials.fragments_for(c, inputs, per_document=None))
             if t["role"] == "people":
                 role_context["people_watch"] = people.public_context(c, r)
         feedback = {"上次校验反馈": t["detail"] + "。请逐字复制输入引文，材料不足时留下缺口。"} if t["detail"] else {}
@@ -1024,7 +1104,8 @@ def run_role(worker, job, r, plan, ctx, ids, t):
                     "SELECT request,result FROM research_tool_steps WHERE task_id=? AND step=?",
                     (t["id"], step),
                 )
-                role_context["事件黑板"] = board.view(c, r["event_id"], r["goal_version"])
+                if job["kind"] != "investigation_wake":
+                    role_context["事件黑板"] = board.view(c, r["event_id"], r["goal_version"])
             if previous:
                 request, response = json.loads(previous["request"]), json.loads(previous["result"])
             else:
@@ -1052,6 +1133,8 @@ def run_role(worker, job, r, plan, ctx, ids, t):
                 request = result.lookup.model_dump()
                 response = role_lookup(worker, r, t, result.lookup)
                 with worker.store.connection(True) as c:
+                    if pinned is not None:
+                        response = wakes.freeze_lookup(c, r, response, frags)
                     c.execute(
                         "INSERT OR IGNORE INTO research_tool_steps VALUES(?,?,?,?)",
                         (t["id"], step, dump(request), dump(response)),
@@ -1064,7 +1147,11 @@ def run_role(worker, job, r, plan, ctx, ids, t):
             ]
             with worker.store.connection(True) as c:
                 c.execute("UPDATE research_tasks SET input_ids=? WHERE id=?", (dump(inputs), t["id"]))
-                frags = materials.fragments_for(c, inputs, per_document=None)
+                if pinned is None:
+                    frags = materials.fragments_for(c, inputs, per_document=None)
+                else:
+                    pinned = list(dict.fromkeys([*pinned, *response.get("fragment_ids", [])]))
+                    frags = wakes.frozen_fragments(c, pinned)
         submitted = len(result.findings)
         rejects = []
         try:
@@ -1185,16 +1272,27 @@ def run_round(worker, job, rid, candidates):
         r = require(c, "tracking_rounds", rid)
         if not workflow.goal_matches(c, r):
             return "研究目标已更新"
+        retry_positions = json.loads(job["args"]).get("review_positions", []) if job["kind"] == "research_retry" else []
+        if retry_positions:
+            latest = workflow.latest(c, r["event_id"])
+            report = delivery.latest_research_snapshot(c, latest["id"]) if latest else None
+            same_round = report and require(c, "knowledge_snapshots", report)["round_id"] == rid
+            open_checks = delivery.view(c, report) if same_round else []
+            if not any(row["position"] in retry_positions and row["state"] == "unknown" and
+                       row["answer"].startswith("独立复核待补：") for row in open_checks):
+                return "该轮关键项已复核或已有新版本"
         if r["state"] in ("published", "unchanged", "superseded"):
-            return r["detail"]
+            if not retry_positions and not (job["kind"] == "handoff_publish" and wakes.unpublished(c, rid)):
+                return r["detail"]
     ids = json.loads(r["input_docs"]) if r["input_docs"] is not None else acquire(worker, r, job)
     if not ids:
         with worker.store.connection() as c:
             return require(c, "tracking_rounds", rid)["detail"]
     with worker.store.connection() as c:
         docs = [require(c, "documents", i) for i in ids]
-    for d in docs:
-        materials.enrich(worker.store, worker.acquisition, d)
+    if job["kind"] != "handoff_publish":
+        for d in docs:
+            materials.enrich(worker.store, worker.acquisition, d)
     with worker.store.connection(True) as c:
         r = require(c, "tracking_rounds", rid)
         if not workflow.goal_matches(c, r):
@@ -1267,7 +1365,8 @@ def run_round(worker, job, rid, candidates):
     }
     if r["world_seed_only"] and not reused_docs:
         with worker.store.connection(True) as c:
-            tasks = rows(c, "SELECT id,role,question FROM research_tasks WHERE round_id=?", (rid,))
+            tasks = rows(c, """SELECT id,role,question FROM research_tasks t WHERE round_id=?
+                        AND NOT EXISTS (SELECT 1 FROM investigation_wakes w WHERE w.task_id=t.id)""", (rid,))
             by_assignment = {(a["role"], a["question"]): a for a in plan["tasks"]}
             for task in tasks:
                 assignment = by_assignment[(task["role"], task["question"])]
@@ -1285,7 +1384,8 @@ def run_round(worker, job, rid, candidates):
                 )
                 return "世界知识候选与目标未匹配，待补来源"
     ids = sorted(reused_docs) if r["world_seed_only"] else list(dict.fromkeys([*ids, *sorted(reused_docs)]))
-    watch.apply_plan(worker.store, worker.acquisition, r, plan)
+    if job["kind"] != "handoff_publish":
+        watch.apply_plan(worker.store, worker.acquisition, r, plan)
     with worker.store.connection(True) as c:
         if job["attempts"] and r["state"] == "researching":
             # The queue can retry a whole failed job once. Re-run only failed roles with their
@@ -1295,8 +1395,13 @@ def run_round(worker, job, rid, candidates):
                          AND NOT EXISTS (SELECT 1 FROM research_tasks WHERE round_id=? AND state='done')""",
                 (rid, rid),
             )
-        tasks = rows(c, "SELECT * FROM research_tasks WHERE round_id=? ORDER BY priority DESC,id", (rid,))
-    pending = [task for task in tasks if task["state"] not in ("done", "failed")]
+        tasks = rows(c, """SELECT * FROM research_tasks t WHERE round_id=?
+                     AND NOT EXISTS (SELECT 1 FROM investigation_wakes w WHERE w.task_id=t.id)
+                     ORDER BY priority DESC,id""", (rid,))
+        deadline = interim_deadline(c, rid, tasks)
+    pending = [] if job["kind"] == "handoff_publish" else [
+        task for task in tasks if task["state"] not in ("done", "failed")
+    ]
     budget_error = ""
     with ThreadPoolExecutor(max_workers=resources.MAX_AGENTS, thread_name_prefix="evosight-role") as pool:
         active = set()
@@ -1309,15 +1414,33 @@ def run_round(worker, job, rid, candidates):
                 active.add(
                     pool.submit(copy_context().run, run_role, worker, job, r, plan, ctx, ids, pending.pop(0))
                 )
-            done, active = wait(active, return_when=FIRST_COMPLETED)
+            # Keep the slow role's lease and work intact. The waiting coordinator can
+            # deliver already archived excerpts even if every inference slot is occupied.
+            remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+            if remaining == 0:
+                with worker.store.connection(True) as c:
+                    if publish_interim(c, r):
+                        deadline = None
+                # If no quotable report has arrived, try again at the next task
+                # completion. The expired deadline must never turn into a busy loop.
+                remaining = None
+            done, active = wait(active, timeout=remaining, return_when=FIRST_COMPLETED)
             for future in done:
                 error = future.result()
                 budget_error = budget_error or error
+    drain_wakes(worker, r, deadline)
     with worker.store.connection() as c:
         tasks = rows(c, "SELECT * FROM research_tasks WHERE round_id=? ORDER BY id", (rid,))
         if not workflow.goal_matches(c, r):
             return "研究目标已更新"
-        completed = [t for t in tasks if t["state"] == "done"]
+        raw_tasks = tasks
+        tasks = claim_review.previously_returned(c, r, raw_tasks)
+        original_tasks = {t["task_id"]: t for t in rows(c, """
+            SELECT w.task_id,w.owner_task AS 原调查任务,t.question AS 原调查问题,l.line_key AS 调查线
+              FROM investigation_wakes w JOIN research_tasks t ON t.id=w.owner_task
+              JOIN investigation_lines l ON l.id=w.line_id WHERE w.round_id=?""", (rid,))}
+        for_synthesis = delivery.reconcile_handoff_gaps(tasks, original_tasks)
+        completed = [t for t in for_synthesis if t["state"] == "done"]
         if not completed and tasks:
             if budget_error:
                 raise DispatchDeferred(budget_error)
@@ -1329,10 +1452,12 @@ def run_round(worker, job, rid, candidates):
                 "task_id": t["id"],
                 "角色": t["role"],
                 "问题": t["question"],
+                **original_tasks.get(t["id"], {}),
                 **validated_task_report(c, t).model_dump(),
             }
             for t in completed
         ]
+        outstanding = [t["question"] for t in tasks if t["state"] != "done"] + pending_handoffs(c, rid, tasks)
         old_judgments = rows(
             c,
             "SELECT title,body FROM nodes WHERE event_id=? AND kind='judgment' ORDER BY id DESC LIMIT 3",
@@ -1352,8 +1477,8 @@ def run_round(worker, job, rid, candidates):
             )
         )
         research_docs = list(dict.fromkeys([*[d["id"] for d in docs], *prior_sources]))
-        review_fragments = materials.fragments_for(c, research_docs, per_document=None)
-        review = delivery.review_inputs(c, r, plan, review_fragments, earlier)
+        review_fragments = wakes.publication_fragments(c, r, research_docs)
+        review = delivery.review_inputs(c, r, plan, review_fragments, earlier, reports)
         shown_ids = {f["id"] for f in review["交付可引用原文"]}
         review_archive = {f["id"]: f for f in review_fragments if f["id"] in shown_ids}
         # The author can cite the archived paragraphs carried from a prior snapshot as well.
@@ -1366,8 +1491,14 @@ def run_round(worker, job, rid, candidates):
         **review,
         "此前判断": old_judgments,
         "本轮研究": reports,
+        **({"本轮待查问题": outstanding} if outstanding else {}),
         "evidence": [{"id": d["id"], "title": d["title"], "summary": d["summary"][:600]} for d in docs],
     }
+    if any(report["task_id"] in original_tasks for report in reports):
+        delivered_docs = {d["id"] for d in docs}
+        synthesis_ctx["archive_fragment_ids"] = [
+            f["id"] for f in review_fragments if f["document_id"] in delivered_docs or f["id"] in review_archive
+        ]
     if not tasks:
         synthesis = Analysis(
             fact="", judgment="", watch="", items=[], discoveries=[], evidence_ids=[], gaps=plan["postponed"]
@@ -1402,6 +1533,9 @@ def run_round(worker, job, rid, candidates):
             supplied = {a.check_id for a in replacements}
             synthesis.delivery = [a for a in synthesis.delivery if a.check_id not in supplied] + replacements
             checked = delivery.inspect(plan, synthesis.delivery, review_archive)
+    adjudicated = claim_review.run(
+        worker, job, r, plan, reports, checked, synthesis, review_fragments, review_archive, raw_tasks
+    )
     try:
         refs = worker.allowed(
             synthesis.evidence_ids,
@@ -1415,7 +1549,12 @@ def run_round(worker, job, rid, candidates):
     with worker.store.connection(True) as c:
         if not workflow.goal_matches(c, r):
             return "研究目标已更新"
-        detail = publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job, checked=checked)
+        if job["kind"] == "handoff_publish" and (redirected := wakes.forward_to_latest(c, r)):
+            return redirected
+        adjudicated.persist(c, r, job, raw_tasks)
+        approved = delivery.reconcile_handoff_gaps(adjudicated.publish_tasks(tasks), original_tasks)
+        detail = publish(c, r, approved, synthesis, refs, plan, docs, candidates,
+                         worker, job, checked=checked)
         queue_failed_tasks(c, r, tasks, job["id"])
         return detail
 
@@ -1423,7 +1562,7 @@ def run_round(worker, job, rid, candidates):
 def queue_failed_tasks(c, r, tasks, source_job):
     failed = []
     for task in tasks:
-        if task["state"] != "failed":
+        if task["state"] != "failed" or one(c, "SELECT 1 FROM investigation_wakes WHERE task_id=?", (task["id"],)):
             continue
         if not c.execute(
             "INSERT OR IGNORE INTO role_retry_sources VALUES(?,?)", (task["id"], source_job)
@@ -1455,7 +1594,7 @@ def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job, *
     event = r["event_id"]
     rid = r["id"]
     signature = workflow.fingerprint(
-        [(t["id"], t["state"], t["result"]) for t in tasks], synthesis.model_dump()
+        [(t["id"], t["state"], t["result"]) for t in tasks], synthesis.model_dump(), checked
     )
     existing = one(
         c, "SELECT snapshot_id FROM round_publications WHERE round_id=? AND signature=?", (rid, signature)
@@ -1463,8 +1602,9 @@ def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job, *
     if existing:
         return f"已发布知识版本 {existing['snapshot_id']}"
     last = workflow.latest(c, event)
-    frags = {f["id"]: f for f in materials.fragments_for(c, [d["id"] for d in docs], per_document=None)}
-    gaps = list(dict.fromkeys([*plan.get("postponed", []), *synthesis.gaps]))
+    frags = {f["id"]: f for f in wakes.publication_fragments(c, r, [d["id"] for d in docs])}
+    pending_wakes = pending_handoffs(c, rid, tasks)
+    gaps = list(dict.fromkeys([*plan.get("postponed", []), *synthesis.gaps, *pending_wakes]))
     changes = []
     added = set()
     contributed = set()
@@ -1769,6 +1909,10 @@ def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job, *
             (snap, link["version_id"], link.get("section", ""), link["reason"]),
         )
     c.execute("INSERT INTO round_publications VALUES(?,?,?)", (rid, signature, snap))
+    c.executemany(
+        "UPDATE investigation_wakes SET snapshot_id=? WHERE task_id=? AND snapshot_id IS NULL",
+        [(snap, t["id"]) for t in tasks if t["state"] == "done"],
+    )
     delivery.save(
         c, snap, checked if checked is not None else delivery.inspect(plan, synthesis.delivery, frags)
     )
@@ -1796,7 +1940,7 @@ def publish(c, r, tasks, synthesis, refs, plan, docs, candidates, worker, job, *
         enqueue(c, "verify", event=event, args={"prediction_id": p["id"], "snapshot_id": snap})
     if changes or synthesis.judgment:
         enqueue(c, "forecast", event=event, args={"snapshot_id": snap})
-    state = "partial" if any(t["state"] != "done" for t in tasks) else "published"
+    state = "partial" if pending_wakes or any(t["state"] != "done" for t in tasks) else "published"
     if any(t["state"] == "deferred" for t in tasks):
         deferred_job = enqueue(c, "research_retry", event=event, args={"round_id": rid})
         if deferred_job != job["id"]:

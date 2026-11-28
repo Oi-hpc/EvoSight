@@ -45,7 +45,7 @@ def run_trials(directory, cases):
     for case in cases:
         title, scope = CASES[case]
         with store.connection(True) as c:
-            existing = one(c, "SELECT * FROM events WHERE title=?", (title,))
+            existing = one(c, "SELECT * FROM events WHERE title=? AND status!='deleted'", (title,))
             if not existing:
                 event = add_event(c, title, scope, [])
                 workflow.begin_event(c, event)

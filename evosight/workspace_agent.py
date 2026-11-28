@@ -239,7 +239,7 @@ def registry(c):
         (SELECT count(*) FROM jobs j WHERE j.event_id=e.id AND j.kind!='discussion' AND j.status='queued') AS queued
         FROM events e JOIN event_goals g ON g.event_id=e.id AND g.version=(
         SELECT max(v.version) FROM event_goals v WHERE v.event_id=e.id)
-        WHERE e.demo=0 ORDER BY (e.status='active') DESC,e.id DESC""",
+        WHERE e.demo=0 AND e.status!='deleted' ORDER BY (e.status='active') DESC,e.id DESC""",
     )
 
 
@@ -270,7 +270,8 @@ def workspace(c, event, question, revision=None, basis="latest"):
         """SELECT t.id,t.event_id,t.question,t.answer,t.context,json_extract(m.response,'$.kind') AS kind,m.response
         FROM discussion_turns t JOIN jobs j ON j.id=t.job_id LEFT JOIN model_receipts m ON m.run_id=t.run_id
         LEFT JOIN events e ON e.id=t.event_id
-        WHERE ((? IS NULL AND (t.event_id IS NULL OR e.demo=0)) OR (t.event_id=? AND t.revision_id IS ? AND t.basis=?))
+        WHERE ((? IS NULL AND (t.event_id IS NULL OR (e.demo=0 AND e.status!='deleted')))
+        OR (t.event_id=? AND t.revision_id IS ? AND t.basis=?))
         AND t.answer IS NOT NULL ORDER BY t.id DESC LIMIT 1""",
         (event, event, revision, basis),
     )
@@ -287,6 +288,8 @@ def workspace(c, event, question, revision=None, basis="latest"):
         default = (
             json.loads(previous["context"]).get("workspace", {}).get("current_event") or previous["event_id"]
         )
+    if not event and default and not any(e["id"] == default for e in all_events):
+        default = None
     selection = None
     if previous and (
         previous["kind"] == "clarification"
@@ -514,7 +517,7 @@ def execute(c, turn, ctx, actions):
             if a.action == "add_focus" and id(a) not in requested:
                 continue
             if isinstance(a, CreateEvent):
-                duplicate = one(c, "SELECT id FROM events WHERE title=? COLLATE NOCASE", (a.title,))
+                duplicate = one(c, "SELECT id FROM events WHERE title=? AND status!='deleted'", (a.title,))
                 if duplicate:
                     raise ValueError(f"该事件名称已经存在。请指定现有事件或换一个名称。")
                 ident = add_event(c, a.title, a.scope or a.title, [])

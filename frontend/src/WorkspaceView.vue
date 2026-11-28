@@ -306,7 +306,7 @@ const shown = computed(
           }}<small>{{ stamp(j.created_at, true) }} · #{{ j.id }}</small>
           <p>{{ j.info }}</p>
           <button
-            v-if="['failed', 'deferred'].includes(j.status)"
+            v-if="j.event_status !== 'deleted' && ['failed', 'deferred'].includes(j.status)"
             class="btn"
             :disabled="busy"
             @click="action('/jobs/' + j.id + '/retry', {}, '任务已重新排队')"

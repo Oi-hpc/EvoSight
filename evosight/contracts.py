@@ -86,6 +86,7 @@ class Assignment(Record):
     search_query: str = Field(default="", max_length=250)
     knowledge_query: KnowledgeQuery | None = None
     line: str = Field(default="", max_length=120)
+    review_checks: list[Annotated[int, Field(ge=1, le=16)]] = Field(default_factory=list, max_length=16)
 
 
 class Monitor(Record):
@@ -130,6 +131,19 @@ class Plan(Record):
     checklist: list[Annotated[str, Field(min_length=2, max_length=400)]] = Field(
         default_factory=list, max_length=16
     )
+
+    @model_validator(mode="after")
+    def align_review_positions(self):
+        submitted = self.checklist or [task.question for task in self.tasks]
+        positions = {question: pos for pos, question in enumerate(dict.fromkeys(submitted), 1)}
+        for task in self.tasks:
+            unknown = [pos for pos in task.review_checks if pos > len(submitted)]
+            if unknown:
+                raise ValueError(f"调查任务引用了不存在的交付清单序号 {unknown}")
+            task.review_checks = list(dict.fromkeys(positions[submitted[i - 1]] for i in task.review_checks))
+        if self.checklist or any(task.review_checks for task in self.tasks):
+            self.checklist = list(positions)
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -278,10 +292,27 @@ class DeliveryAnswer(Record):
     citations: list[Citation] = Field(default_factory=list, max_length=6)
 
 
+class ClaimVerdict(Record):
+    check_id: PositiveInt
+    decision: Literal["supported", "return"]
+    reason: str = Field(min_length=2, max_length=600)
+    citations: list[Citation] = Field(default_factory=list, max_length=6)
+
+
+class ClaimReview(Record):
+    items: list[ClaimVerdict] = Field(max_length=16)
+
+
+class ResolvedGap(Record):
+    gap: str = Field(min_length=1)
+    fragment_id: PositiveInt
+
+
 class Report(Record):
     findings: list[Finding] = Field(default_factory=list, max_length=8)
     use_knowledge: list[KnowledgeLink] = Field(default_factory=list, max_length=4)
     gaps: list[str] = Field(default_factory=list, max_length=8)
+    resolved_gaps: list[ResolvedGap] = Field(default_factory=list, max_length=8)
     followups: list[Followup] = Field(default_factory=list, max_length=5)
     answered: list[int] = Field(default_factory=list, max_length=6)
     lookup: ResearchLookup | None = None
@@ -290,6 +321,8 @@ class Report(Record):
 PLANNER = (
     "checklist 按用户原始研究目标列出逐项可独立验收的问题，一项只核查一件事。"
     "即使已有结论，也保留仍属本轮范围的核查点。取证任务的数量不限制交付清单的项数。"
+    "对会改变用户决策或预测、容易混淆适用范围或有相反材料的关键项，在负责取证的那条任务的 review_checks 填 checklist 的序号（从1开始）。"
+    "每项指定一个负责补证的调查者；普通事实可留空。"
     "你负责事件规划。优先只安排一条能回答开放问题的调查线，存在独立问题才并行。line 复用黑板上同一调查线的名称。"
     "guides 按问题保存值得长期查阅的世界知识目的地。每项写 question、reason、wake、lookup。目录为空也可保留，旧指南失效时填 retire_guides 的 ID。"
     "collection_scope 为用户在本事件中指定的每轮收集范围。优先辨认其中的具名人物、核对本轮材料与关注点，尚无直接材料时记录核查缺口。"
@@ -317,6 +350,8 @@ ROLE_INSTRUCTIONS["people"] += (
     "变化、可能影响及未知之处。心理或动机解释列为假设，须给替代解释和反证条件。"
 )
 RESEARCH = (
+    "接到交接补查时，如果本次直接原文已经回答了上次调查结果中的某条 gaps，在 resolved_gaps 逐字填那条 gap，"
+    "并填本次事实或订正实际引用的 fragment_id。只补了一部分时，在本次 gaps 写清剩余问题。其他情况填空数组。"
     "资料卡的发布方由系统读取归档元数据。其他字段由你提议，逐项给 field_citations。"
     "source 可填引用片段所附原始 URL，format 填档案实际形态（例如网页正文、订阅摘要），"
     "stage 尽可能逐字摘取能说明实际阶段的短语。无法定位的值留空。"

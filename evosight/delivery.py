@@ -5,11 +5,39 @@ from collections import defaultdict
 from decimal import Decimal
 
 from . import grounding
+from .contracts import Report
 from .db import dump, rows
 
 
 def checklist(plan):
     return list(dict.fromkeys(plan.get("checklist") or [t["question"] for t in plan.get("tasks", [])]))
+
+
+def reconcile_handoff_gaps(tasks, original_tasks):
+    """Project resolved owner gaps out of this publication. Keep both investigation receipts intact."""
+    resolved = defaultdict(set)
+    for task in tasks:
+        original = original_tasks.get(task["id"])
+        if not original or task["state"] != "done":
+            continue
+        report = Report.model_validate_json(task["result"])
+        supporting = {
+            ref.fragment_id for finding in report.findings if finding.kind in ("fact", "reported", "correction")
+            for ref in finding.citations
+        }
+        resolved[original["原调查任务"]].update(
+            item.gap for item in report.resolved_gaps if item.fragment_id in supporting
+        )
+    projected = []
+    for task in tasks:
+        if task["state"] == "done" and resolved.get(task["id"]):
+            report = Report.model_validate_json(task["result"])
+            kept = [gap for gap in report.gaps if gap not in resolved[task["id"]]]
+            if kept != report.gaps:
+                report.gaps = kept
+                task = {**task, "result": report.model_dump_json()}
+        projected.append(task)
+    return projected
 
 
 def earlier_work(c, r):
@@ -58,13 +86,19 @@ def earlier_work(c, r):
     return leads[:28], predictions
 
 
-def review_inputs(c, r, plan, fragments, earlier=None):
+def review_inputs(c, r, plan, fragments, earlier=None, reports=()):
     leads, predictions = earlier if earlier is not None else earlier_work(c, r)
     allowed = {f["id"]: f for f in fragments}
     # Preserve older cited paragraphs when a long new document uses most of the prompt.
+    # Start with each line's direct citations. A late handoff or corrective
+    # filing may be near the end of a large archive.
+    report_refs = [[ref["fragment_id"] for f in report["findings"] for ref in f["citations"]]
+                   for report in reports]
+    cited = [refs[offset] for offset in range(max(map(len, report_refs), default=0))
+             for refs in report_refs if offset < len(refs) and refs[offset] in allowed]
     wanted = list(
         dict.fromkeys(
-            [f["id"] for f in fragments[:24]]
+            cited + [f["id"] for f in fragments[:24]]
             + [i for lead in leads for i in lead["fragment_ids"] if i in allowed]
         )
     )[:42]

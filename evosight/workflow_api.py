@@ -137,6 +137,7 @@ def register_workflow_api(app, store):
     @app.post("/api/events/{event}/focus/{ident}/pause")
     def pause_scope(event: int, ident: int):
         with store.connection(True) as c:
+            require(c, "events", event)
             found = require(c, "event_focus", ident)
             if found["event_id"] != event:
                 raise ValueError("该收集范围不属于当前事件")
@@ -293,6 +294,19 @@ def register_workflow_api(app, store):
                 raise workflow.VersionConflict("该轮目标已更改，请使用当前研究轮次")
             if task and require(c, "research_tasks", task)["round_id"] != rid:
                 raise KeyError()
+            # The supplemental role owns a separate lease and a frozen prompt.
+            # Restoring only research_tasks.state would leave it without an executor.
+            wake_jobs = rows(c, """SELECT w.job_id FROM investigation_wakes w JOIN jobs j ON j.id=w.job_id
+                            WHERE w.round_id=? AND w.snapshot_id IS NULL AND (?=0 OR w.task_id=?)
+                            AND j.status IN ('queued','running','failed','deferred') ORDER BY j.id""",
+                             (rid, task, task))
+            if wake_jobs:
+                c.executemany(
+                    """UPDATE jobs SET status='queued',attempts=0,retry_at=NULL,finished_at=NULL,lease=NULL,owner=NULL
+                       WHERE id=? AND status IN ('failed','queued')""", [(w["job_id"],) for w in wake_jobs],
+                )
+                if task or r["state"] in ("published", "unchanged"):
+                    return {"job": wake_jobs[0]["job_id"]}
             busy = one(
                 c,
                 "SELECT id FROM jobs WHERE event_id=? AND json_extract(args,'$.round_id')=? AND status IN ('queued','running')",
@@ -330,6 +344,7 @@ def register_workflow_api(app, store):
     @app.post("/api/events/{event}/watch")
     def watch_choice(event: int, data: WatchChoice):
         with store.connection(True) as c:
+            require(c, "events", event)
             cur = c.execute(
                 "UPDATE event_platforms SET watching=?,pinned=1 WHERE event_id=? AND url=?",
                 (int(data.watching), event, public_url(data.url)),
@@ -358,6 +373,7 @@ def register_workflow_api(app, store):
     @app.get("/api/events/{event}/documents/{ident}/fragments")
     def evidence_fragments(event: int, ident: int):
         with store.connection() as c:
+            require(c, "events", event)
             if not one(c, "SELECT 1 FROM event_docs WHERE event_id=? AND document_id=?", (event, ident)):
                 raise KeyError()
             assets = rows(
@@ -376,6 +392,7 @@ def register_workflow_api(app, store):
     @app.get("/api/events/{event}/assets/{ident}/original")
     def original(event: int, ident: int):
         with store.connection() as c:
+            require(c, "events", event)
             obj = one(
                 c,
                 """SELECT b.content,b.mime FROM evidence_assets a JOIN evidence_blobs b ON b.digest=a.digest

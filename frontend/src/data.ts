@@ -91,6 +91,7 @@ export interface Job {
   created_at: string
   info: string
   event_title: string | null
+  event_status?: string | null
   topic_name?: string
 }
 export interface Run {
@@ -305,6 +306,9 @@ export const labels: Record<string, string> = {
   counter: '反证研究',
   dependencies: '预测依赖',
   research_retry: '补做研究',
+  investigation_wake: '交接补查',
+  handoff_publish: '更新交接结论',
+  claim_review: '关键结论复核',
   scheduled_collect: '定时采集',
   cancelled: '已取消',
   plan: '研究规划',

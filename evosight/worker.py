@@ -20,6 +20,7 @@ from . import (
     research,
     resources,
     scenarios,
+    wakes,
     watch,
     workflow,
 )
@@ -107,11 +108,14 @@ def forecast_fragments(c, docs):
 
 def admit(c, ident):
     candidate = require(c, "candidates", ident)
+    if candidate["event_id"] is not None:
+        require(c, "events", candidate["event_id"])
     if candidate["state"] == "accepted":
+        require(c, "events", candidate["target_id"])
         return candidate["target_id"]
     if candidate["state"] != "review":
         raise ValueError("该候选已关闭")
-    existing = one(c, "SELECT id,status FROM events WHERE title=?", (candidate["title"],))
+    existing = one(c, "SELECT id FROM events WHERE title=? AND status!='deleted'", (candidate["title"],))
     if existing:
         target = existing["id"]
     else:
@@ -182,9 +186,15 @@ def candidates(c, proposals, event, topic, refs, sources, *, allow_auto=True):
 
 def schedule(c):
     now = utc()
-    c.execute("UPDATE predictions SET status='frozen' WHERE status='open' AND deadline<=?", (now,))
     c.execute(
-        "UPDATE fixed_questions SET reason='到达截止时间前未提交有效回答' WHERE prediction_id IS NULL AND reason='' AND deadline<=?",
+        """UPDATE predictions SET status='frozen' WHERE status='open' AND deadline<=?
+           AND event_id IN (SELECT id FROM events WHERE status!='deleted')""",
+        (now,),
+    )
+    c.execute(
+        """UPDATE fixed_questions SET reason='到达截止时间前未提交有效回答'
+           WHERE prediction_id IS NULL AND reason='' AND deadline<=?
+           AND event_id IN (SELECT id FROM events WHERE status!='deleted')""",
         (now,),
     )
     limits = config(c)
@@ -203,7 +213,8 @@ def schedule(c):
             c.execute("UPDATE jobs SET status='queued',retry_at=NULL,finished_at=NULL WHERE id=?", (j["id"],))
     for p in rows(
         c,
-        """SELECT p.id,p.event_id FROM predictions p JOIN events e ON e.id=p.event_id WHERE e.demo=0 AND
+        """SELECT p.id,p.event_id FROM predictions p JOIN events e ON e.id=p.event_id
+           WHERE e.demo=0 AND e.status!='deleted' AND
            (p.status IN ('review','frozen') OR (p.status='open' AND EXISTS(
               SELECT 1 FROM round_prediction_gates g JOIN tracking_rounds r ON r.id=g.round_id
               WHERE g.prediction_id=p.id AND g.state='checking' AND r.state IN ('published','partial'))))""",
@@ -235,6 +246,15 @@ def schedule(c):
         if not one(c, "SELECT 1 FROM events WHERE topic_id=? AND status='active' LIMIT 1", (t["id"],)):
             enqueue(c, "discover", topic=t["id"], slot=f"topic:{t['id']}:{t['next_run']}")
         c.execute("UPDATE topics SET next_run=? WHERE id=?", (later(21600), t["id"]))
+
+
+def finish_deleted_job(c, ident):
+    c.execute("UPDATE runs SET status='interrupted' WHERE job_id=? AND status='running'", (ident,))
+    c.execute(
+        """UPDATE jobs SET status='cancelled',info=?,finished_at=?,owner=NULL,lease=NULL,retry_at=NULL
+           WHERE id=?""",
+        (workflow.EVENT_DELETED, utc(), ident),
+    )
 
 
 class Worker:
@@ -280,11 +300,19 @@ class Worker:
                 worked = False
             self.stop.wait(0.2 if worked else 4)
 
-    def step(self):
+    def step(self, *, wake_job=None):
         with self.store.connection(True) as c:
             schedule(c)
-            expired = rows(c, "SELECT id FROM jobs WHERE status='running' AND lease<?", (utc(),))
+            expired = rows(
+                c,
+                """SELECT j.id,e.status AS event_status FROM jobs j LEFT JOIN events e ON e.id=j.event_id
+                   WHERE j.status='running' AND j.lease<?""",
+                (utc(),),
+            )
             for old in expired:
+                if old["event_status"] == "deleted":
+                    finish_deleted_job(c, old["id"])
+                    continue
                 c.execute(
                     "UPDATE runs SET status='interrupted' WHERE job_id=? AND status='running'", (old["id"],)
                 )
@@ -294,18 +322,26 @@ class Worker:
             if config(c)["global_pause"]:
                 return False
             running = rows(c, "SELECT kind FROM jobs WHERE status='running'")
-            if len(running) >= resources.capacity(c)["effective"]:
+            capacity = resources.capacity(c)["effective"]
+            if not capacity or (wake_job is None and len(running) >= capacity):
                 return False
-            writer_busy = any(j["kind"] != "discussion" for j in running)
+            writer_busy = any(j["kind"] not in ("discussion", "investigation_wake") for j in running)
             job = one(
                 c,
                 """SELECT * FROM jobs WHERE status='queued' AND (retry_at IS NULL OR retry_at<=?)
-                      AND (?=0 OR kind='discussion')
-                      ORDER BY CASE WHEN kind='verify' THEN 0 WHEN kind='discussion' THEN 1
+                      AND (? IS NULL OR (kind='investigation_wake' AND id=?))
+                      AND (?=0 OR kind IN ('discussion','investigation_wake'))
+                      AND (kind!='investigation_wake' OR EXISTS (
+                        SELECT 1 FROM investigation_wakes w JOIN research_tasks t ON t.id=w.owner_task
+                        WHERE w.job_id=jobs.id AND (t.round_id!=w.round_id OR t.state NOT IN ('queued','running')
+                        OR NOT EXISTS (SELECT 1 FROM jobs owner JOIN tracking_rounds r
+                          ON owner.id=r.job_id WHERE r.id=w.round_id AND owner.status='running'))))
+                      ORDER BY CASE WHEN kind='verify' THEN 0 WHEN kind IN ('discussion','investigation_wake') THEN 1
+                      WHEN kind='handoff_publish' THEN 2
                       WHEN kind='collect' AND EXISTS(SELECT 1 FROM tracking_rounds r,json_each(r.reasons) why
                         WHERE r.job_id=jobs.id AND why.value='新增收集范围') THEN 2
                       WHEN kind='forecast' THEN 3 ELSE 4 END,id LIMIT 1""",
-                (utc(), writer_busy),
+                (utc(), wake_job, wake_job, writer_busy),
             )
             if not job:
                 return False
@@ -356,6 +392,9 @@ class Worker:
                 "SELECT 1 FROM jobs WHERE id=? AND owner=? AND status='running' AND lease>=?",
                 (job["id"], token, utc()),
             ):
+                return True
+            if one(c, "SELECT 1 FROM events WHERE id=? AND status='deleted'", (job["event_id"],)):
+                finish_deleted_job(c, job["id"])
                 return True
             if status == "resource_wait":
                 c.execute(
@@ -483,9 +522,9 @@ class Worker:
                 ):
                     run = book_run(c, job["id"], role, model, effort)
                     prompt_ctx = dict(ctx)
-                    messages = (
-                        board.inbox(c, job["event_id"], recipient) if lane and job.get("event_id") else []
-                    )
+                    messages = []
+                    if lane and job.get("event_id") and job["kind"] != "investigation_wake":
+                        messages = board.inbox(c, job["event_id"], recipient)
                     if messages:
                         prompt_ctx["待处理交接"] = messages
                     if session.get("last_run"):
@@ -762,6 +801,18 @@ class Worker:
                         (args["round_id"], dump(args["failed_tasks"])),
                     )
             return research.run_round(self, job, args.get("round_id"), candidates)
+        if job["kind"] == "investigation_wake":
+            return wakes.run(self, job)
+        if job["kind"] == "handoff_publish":
+            with self.store.connection(True) as c:
+                if not wakes.unpublished(c, args["source_round"]):
+                    return "交接结论已纳入本轮报告"
+                r = require(c, "tracking_rounds", args["source_round"])
+                if not workflow.goal_matches(c, r):
+                    return "目标已更新，交接已停止"
+                if message := wakes.forward_to_latest(c, r):
+                    return message
+            return research.run_round(self, job, args["source_round"], candidates)
         if job["kind"] == "guide_check":
             return research.run_guide(self, job, args, candidates)
         with self.store.connection() as c:
@@ -829,11 +880,12 @@ class Worker:
                         c, "SELECT payload FROM snapshot_contexts WHERE snapshot_id=?", (snapshot["id"],)
                     )
                     frozen_board = json.loads(frozen["payload"]).get("board", {}) if frozen else {}
-                    ctx["本轮正式核查报告"] = [
-                        row
-                        for row in delivery.view(c, snapshot["id"])
-                        if row["state"] in ("confirmed", "unknown")
-                    ]
+                    report_version = delivery.latest_research_snapshot(c, snapshot["id"])
+                    report = delivery.view(c, report_version) if report_version else []
+                    ctx["本轮正式核查报告"] = [row for row in report if row["state"] in ("confirmed", "unknown")]
+                    checks = scenarios.unresolved_checklist(c, report_version, report)
+                    if checks:
+                        ctx["预测核查清单"] = checks
                     ctx["待核查的事件材料"] = [
                         {"subject": n["subject"], "reason": n["reason"]}
                         for n in frozen_board.get("notes", [])[:6]
@@ -848,6 +900,8 @@ class Worker:
                 ctx["上次校验反馈"] = job["info"]
             context = {**ctx, "evidence": compact(docs)}
             draft, model, run = self.call_recorded(job, "forecast", context)
+            if reason := scenarios.forecast_check_hold(draft, context):
+                return self.note(job, event, fixed, reason)
             if draft.action != "hold" and (fixed or draft.scale or draft.action == "revise"):
                 author_run = run
                 registration = fixed or next((p for p in ctx["已有预测"] if p["id"] == draft.prediction_id), None)
@@ -874,6 +928,8 @@ class Worker:
                     "已有预测": [],
                     "evidence_fragments": context["evidence_fragments"],
                 }
+                if "预测核查清单" in context:
+                    independent["预测核查清单"] = context["预测核查清单"]
                 with self.store.connection() as c:
                     recorded = one(
                         c, "SELECT json_extract(payload,'$.archive_fragment_ids') AS files FROM run_inputs WHERE run_id=?",
@@ -891,6 +947,13 @@ class Worker:
                         }
                     ]
                 second, _, review_run = self.call_recorded(job, "forecast", independent)
+                if reason := scenarios.forecast_check_hold(second, independent):
+                    with self.store.connection(True) as c:
+                        c.execute(
+                            "INSERT OR REPLACE INTO forecast_reviews VALUES(?,?,?,?,?)",
+                            (job["id"], author_run, review_run, review_run, reason),
+                        )
+                    return self.note(job, event, fixed, reason)
                 disagreement = (
                     second.action == "hold"
                     or bool(draft.outlook) != bool(second.outlook)
@@ -923,6 +986,8 @@ class Worker:
                     )
             if draft.action == "hold":
                 return self.note(job, event, fixed, draft.reason)
+            if reason := scenarios.forecast_check_hold(draft, context):
+                return self.note(job, event, fixed, reason)
             refs = self.allowed(draft.evidence_ids, docs)
             if not set(draft.lesson_ids) <= {x["id"] for x in ctx["可用复盘经验"]}:
                 raise ValueError("引用的复盘经验不属于本次输入")

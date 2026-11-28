@@ -147,3 +147,57 @@ def check_draft(draft, context, now):
         raise ValueError("二元题需一个明确的概率，分级题需已定义的分档")
     if not draft.evidence_ids or not set(draft.evidence_ids) <= {d["id"] for d in context["evidence"]}:
         raise ValueError("预测须逐项引用本次收到的证据")
+
+
+def unresolved_checklist(c, report_version, report):
+    """Retain declared gaps while allowing older plans that only listed investigation tasks."""
+    if not report_version:
+        return []
+    row = one(
+        c,
+        """SELECT r.plan FROM knowledge_snapshots s JOIN tracking_rounds r ON r.id=s.round_id
+           WHERE s.id=?""",
+        (report_version,),
+    )
+    plan = json.loads(row["plan"] or "{}") if row else {}
+    explicit = set(plan.get("checklist", []))
+    if not any(
+        item["state"] == "unknown" or (item["question"] in explicit and item["state"] != "confirmed")
+        for item in report
+    ):
+        return []
+    return [
+        {
+            "id": item["position"],
+            "question": item["question"],
+            "state": item["state"],
+            "documents": sorted({ref["document_id"] for ref in item["citations"]}),
+        }
+        for item in report
+    ]
+
+
+def forecast_check_hold(draft, context):
+    checks = context.get("预测核查清单", [])
+    if not checks:
+        return ""
+    if draft.required_checks is None and draft.action != "hold":
+        return "研究报告仍有待查项，本次预测尚未说明依赖哪些核查项"
+    selected = set(draft.required_checks or [])
+    if selected - {row["id"] for row in checks}:
+        return "预测引用的核查项未出现在本版报告"
+    question = (context.get("固定题") or {}).get("question") or draft.question
+    if draft.action == "revise":
+        question = next(
+            (p["question"] for p in context.get("已有预测", []) if p["id"] == draft.prediction_id),
+            question,
+        )
+    question = question.strip().rstrip("。？?").casefold()
+    for row in checks:
+        if row["id"] not in selected and row["question"].strip().rstrip("。？?").casefold() != question:
+            continue
+        if row["state"] != "confirmed":
+            return "预测依赖的核查项仍待补证：" + row["question"]
+        if draft.action != "hold" and not set(row["documents"]).intersection(draft.evidence_ids):
+            return "预测尚未引用所依赖核查项的原始材料：" + row["question"]
+    return ""

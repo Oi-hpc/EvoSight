@@ -25,6 +25,7 @@ import {
   Plus,
   RefreshCw,
   Target,
+  Trash2,
   UsersRound,
 } from 'lucide-vue-next'
 import {
@@ -49,12 +50,15 @@ const props = defineProps<{
 const emit = defineEmits<{
   message: [s: string]
   changed: []
+  deleted: []
   form: [k: FormKind, d: Details, p?: Prediction]
 }>()
 const d = ref<Details | null>(null),
   timeline = ref<Timeline | null>(null),
   err = ref(''),
   busy = ref(false)
+const deleteDialog = ref<HTMLDialogElement>()
+const deleteError = ref('')
 const kind = ref(''),
   order = ref('known'),
   item = ref(0),
@@ -158,6 +162,24 @@ async function mutate(path: string, body: unknown, note: string) {
     busy.value = false
   }
 }
+function confirmDeletion() {
+  deleteError.value = ''
+  deleteDialog.value?.showModal()
+}
+async function removeEvent() {
+  if (busy.value) return
+  busy.value = true
+  deleteError.value = ''
+  try {
+    await api('/events/' + props.eventId, {}, 'DELETE')
+    deleteDialog.value?.close()
+    emit('deleted')
+  } catch (e) {
+    deleteError.value = (e as Error).message
+  } finally {
+    busy.value = false
+  }
+}
 function form(k: FormKind, p?: Prediction) {
   if (d.value) emit('form', k, d.value, p)
 }
@@ -236,8 +258,31 @@ const tabList = [
         >
           <CheckCheck />读到这里
         </button>
+        <button v-if="!d.card.demo" class="btn danger" :disabled="busy" @click="confirmDeletion">
+          <Trash2 />删除追踪事件
+        </button>
       </div>
     </header>
+    <dialog
+      v-if="!d.card.demo"
+      ref="deleteDialog"
+      class="modal delete-dialog"
+      aria-labelledby="delete-event-heading"
+      aria-describedby="delete-event-description"
+      @cancel="(e) => busy && e.preventDefault()"
+    >
+      <header><h2 id="delete-event-heading">删除追踪事件</h2></header>
+      <p id="delete-event-description">
+        “{{ d.card.title }}”将从工作台移除，后续追踪和预测核验将停止。此操作无法在工作台撤销。
+      </p>
+      <p v-if="deleteError" class="error" role="alert">{{ deleteError }}</p>
+      <div class="actions">
+        <button class="btn" autofocus :disabled="busy" @click="deleteDialog?.close()">取消</button>
+        <button class="btn danger delete-confirm" :disabled="busy" @click="removeEvent">
+          {{ busy ? '正在删除…' : '确认删除' }}
+        </button>
+      </div>
+    </dialog>
     <div class="tabs view-tabs">
       <a
         v-for="[id, name, icon] in tabList"
@@ -620,3 +665,25 @@ const tabList = [
     </div></template
   >
 </template>
+
+<style scoped>
+.btn.danger {
+  color: var(--red);
+}
+.btn.delete-confirm {
+  background: var(--red);
+  border-color: var(--red);
+  color: #fff;
+}
+.btn.delete-confirm:hover:not(:disabled) {
+  background: #873029;
+  border-color: #873029;
+}
+.delete-dialog {
+  width: min(460px, calc(100% - 32px));
+  overflow-wrap: anywhere;
+}
+.delete-dialog::backdrop {
+  background: rgb(21 38 31 / 35%);
+}
+</style>
